@@ -32,6 +32,7 @@
 
 #if defined(UNIX_ENABLED)
 
+#include "core/io/file_system_write_hook.h"
 #include "core/os/os.h"
 #include "core/string/print_string.h"
 #include "core/templates/list.h"
@@ -417,6 +418,15 @@ Error DirAccessUnix::rename(String p_path, String p_new_path) {
 		p_new_path = p_new_path.left(-1);
 	}
 
+#ifdef TOOLS_ENABLED
+	if (FileSystemWriteHook::get_singleton()) {
+		Error hook_err = FileSystemWriteHook::get_singleton()->before_rename(p_path, p_new_path);
+		if (hook_err != ERR_SKIP) {
+			return hook_err;
+		}
+	}
+#endif
+
 	int res = ::rename(p_path.utf8().get_data(), p_new_path.utf8().get_data());
 	if (res != 0 && errno == EXDEV) { // Cross-device move, use copy and remove.
 		Error err = OK;
@@ -439,6 +449,15 @@ Error DirAccessUnix::remove(String p_path) {
 	if (p_path.ends_with("/")) {
 		p_path = p_path.left(-1);
 	}
+
+#ifdef TOOLS_ENABLED
+	if (FileSystemWriteHook::get_singleton()) {
+		Error hook_err = FileSystemWriteHook::get_singleton()->before_remove(p_path);
+		if (hook_err != ERR_SKIP) {
+			return hook_err;
+		}
+	}
+#endif
 
 	struct stat flags = {};
 	if (lstat(p_path.utf8().get_data(), &flags) != 0) {

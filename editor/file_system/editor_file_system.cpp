@@ -34,6 +34,7 @@
 #include "core/extension/gdextension_manager.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
+#include "core/io/file_system_write_hook.h"
 #include "core/io/resource_importer.h"
 #include "core/io/resource_loader.h"
 #include "core/io/resource_saver.h"
@@ -3323,6 +3324,18 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 
 	// Emit the resource_reimporting signal for the single file before the actual importation.
 	emit_signal(SNAME("resources_reimporting"), reloads);
+
+	if (FileSystemWriteHook::get_singleton()) {
+		// Let version control prepare every `.import` file at once instead of one by one.
+		Vector<String> import_files;
+		for (const String &file : reloads) {
+			import_files.push_back(file + ".import");
+		}
+		for (const String &group_file : groups_to_reimport) {
+			import_files.push_back(group_file);
+		}
+		FileSystemWriteHook::get_singleton()->prepare_writes(import_files);
+	}
 
 #ifdef WEB_ENABLED
 	// On web, busy-wait loops on the main thread block the JavaScript event loop,

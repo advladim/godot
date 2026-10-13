@@ -32,6 +32,7 @@
 
 #include "dir_access_windows.h"
 
+#include "core/io/file_system_write_hook.h"
 #include "core/os/memory.h"
 #include "core/os/os.h"
 #include "core/string/print_string.h"
@@ -307,6 +308,15 @@ Error DirAccessWindows::rename(String p_path, String p_new_path) {
 	String path = fix_path(p_path);
 	String new_path = fix_path(p_new_path);
 
+#ifdef TOOLS_ENABLED
+	if (FileSystemWriteHook::get_singleton()) {
+		Error hook_err = FileSystemWriteHook::get_singleton()->before_rename(path, new_path);
+		if (hook_err != ERR_SKIP) {
+			return hook_err;
+		}
+	}
+#endif
+
 	// If we're only changing file name case we need to do a little juggling
 	if (path.to_lower() == new_path.to_lower()) {
 		if (dir_exists(path)) {
@@ -349,6 +359,15 @@ Error DirAccessWindows::rename(String p_path, String p_new_path) {
 
 Error DirAccessWindows::remove(String p_path) {
 	String path = fix_path(p_path);
+
+#ifdef TOOLS_ENABLED
+	if (FileSystemWriteHook::get_singleton()) {
+		Error hook_err = FileSystemWriteHook::get_singleton()->before_remove(path);
+		if (hook_err != ERR_SKIP) {
+			return hook_err;
+		}
+	}
+#endif
 	const Char16String &path_utf16 = path.utf16();
 
 	DWORD fileAttr;

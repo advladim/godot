@@ -36,6 +36,7 @@
 #include "core/io/file_access_compressed.h"
 #include "core/io/file_access_encrypted.h"
 #include "core/io/file_access_pack.h"
+#include "core/io/file_system_write_hook.h"
 #include "core/io/marshalls.h"
 #include "core/io/resource_uid.h"
 #include "core/object/class_db.h"
@@ -153,7 +154,20 @@ void FileAccess::_delete_temp() {
 	DirAccess::remove_absolute(_temp_path);
 }
 
+static Error _notify_write_hook(const String &p_path, int p_mode_flags) {
+#ifdef TOOLS_ENABLED
+	if ((p_mode_flags & FileAccess::WRITE) && FileSystemWriteHook::get_singleton()) {
+		return FileSystemWriteHook::get_singleton()->before_write(p_path);
+	}
+#endif
+	return OK;
+}
+
 Error FileAccess::reopen(const String &p_path, int p_mode_flags) {
+	Error hook_err = _notify_write_hook(p_path, p_mode_flags);
+	if (hook_err != OK) {
+		return hook_err;
+	}
 	return open_internal(p_path, p_mode_flags);
 }
 
@@ -169,6 +183,14 @@ Ref<FileAccess> FileAccess::open(const String &p_path, int p_mode_flags, Error *
 			}
 			return ret;
 		}
+	}
+
+	Error hook_err = _notify_write_hook(p_path, p_mode_flags);
+	if (hook_err != OK) {
+		if (r_error) {
+			*r_error = hook_err;
+		}
+		return ret;
 	}
 
 	ret = create_for_path(p_path);

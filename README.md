@@ -1,5 +1,10 @@
 # Godot Engine
 
+> **This is a fork of Godot 4.7.2 with Perforce integration** (branch `perforce`).
+> The editor checks files out, adds, moves and deletes them in Perforce automatically, has a
+> Perforce panel in the bottom dock, and merges scenes edited by several people.
+> See [PERFORCE.md](PERFORCE.md) for using it and [BUILDING.md](BUILDING.md) for building it.
+
 <p align="center">
   <a href="https://godotengine.org">
     <img src="misc/logo/logo_outlined.svg" width="400" alt="Godot Engine logo">
