@@ -72,6 +72,7 @@ class PerforcePlugin : public EditorPlugin {
 	bool confirm_is_submit = false;
 	bool confirm_is_p4ignore = false;
 	PerforceResolveDialog *resolve_dialog = nullptr;
+	Vector<ObjectID> owned_nodes; // Everything created above, freed in the destructor if still unowned.
 
 	bool connected = false;
 	String project_root;

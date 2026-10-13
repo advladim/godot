@@ -907,6 +907,10 @@ PerforcePlugin::PerforcePlugin() {
 	hint->set_modulate(Color(1, 1, 1, 0.65));
 	vbox->add_child(hint);
 
+	for (Node *node : { (Node *)dock, (Node *)connection_dialog, (Node *)confirm_dialog, (Node *)resolve_dialog, (Node *)flush_timer, (Node *)refresh_timer, (Node *)poll_timer }) {
+		owned_nodes.push_back(node->get_instance_id());
+	}
+
 	// Install the hook now: the editor writes its caches (and maybe project.godot)
 	// while loading, before plugins enter the tree or the background connection
 	// check finishes. It's removed again if the project isn't in a Perforce workspace.
@@ -916,8 +920,12 @@ PerforcePlugin::PerforcePlugin() {
 
 PerforcePlugin::~PerforcePlugin() {
 	_remove_hook();
-	for (Node *node : { (Node *)dock, (Node *)connection_dialog, (Node *)confirm_dialog, (Node *)resolve_dialog, (Node *)flush_timer, (Node *)refresh_timer, (Node *)poll_timer }) {
-		if (!node->is_inside_tree() && !node->get_parent()) {
+	// The dialogs live under the editor's base control, which may already be
+	// freed when plugins are destroyed: only touch nodes that still exist, and
+	// only free the ones nothing else owns (e.g. the dock after remove_dock()).
+	for (ObjectID id : owned_nodes) {
+		Node *node = ObjectDB::get_instance<Node>(id);
+		if (node && !node->get_parent()) {
 			memdelete(node);
 		}
 	}
