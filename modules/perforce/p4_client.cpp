@@ -265,6 +265,25 @@ Error P4Client::set_variable(const String &p_name, const String &p_value) {
 	return err != OK ? err : (exit_code == 0 ? OK : FAILED);
 }
 
+bool P4Client::is_read_only(const String &p_path) {
+#ifdef WINDOWS_ENABLED
+	return FileAccess::get_read_only_attribute(p_path);
+#else
+	// FileAccess::get_read_only_attribute() only reports the BSD/macOS immutable flag.
+	return !FileAccess::get_unix_permissions(p_path).has_flag(FileAccess::UNIX_WRITE_OWNER);
+#endif
+}
+
+void P4Client::make_writable(const String &p_path) {
+#ifdef WINDOWS_ENABLED
+	FileAccess::set_read_only_attribute(p_path, false);
+#else
+	BitField<FileAccess::UnixPermissionFlags> permissions = FileAccess::get_unix_permissions(p_path);
+	permissions.set_flag(FileAccess::UNIX_WRITE_OWNER);
+	FileAccess::set_unix_permissions(p_path, permissions);
+#endif
+}
+
 String P4Client::escape(const String &p_path) {
 	return p_path.replace("%", "%25").replace("@", "%40").replace("#", "%23").replace("*", "%2A");
 }

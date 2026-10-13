@@ -85,8 +85,8 @@ bool PerforceWriteHook::_unlock_cache_file(const String &p_abs_path) const {
 #endif
 		return false;
 	}
-	if (FileAccess::exists(p_abs_path) && FileAccess::get_read_only_attribute(p_abs_path)) {
-		FileAccess::set_read_only_attribute(p_abs_path, false);
+	if (FileAccess::exists(p_abs_path) && P4Client::is_read_only(p_abs_path)) {
+		P4Client::make_writable(p_abs_path);
 	}
 	return true;
 }
@@ -125,7 +125,7 @@ P4Result::Record PerforceWriteHook::_fstat(const String &p_abs_path) {
 bool PerforceWriteHook::checkout(const Vector<String> &p_abs_paths) {
 	Vector<String> to_edit, candidates;
 	for (const String &path : p_abs_paths) {
-		if (_is_managed(path) && FileAccess::exists(path) && FileAccess::get_read_only_attribute(path)) {
+		if (_is_managed(path) && FileAccess::exists(path) && P4Client::is_read_only(path)) {
 			to_edit.push_back(P4Client::escape(path));
 			candidates.push_back(path);
 		}
@@ -144,7 +144,7 @@ bool PerforceWriteHook::checkout(const Vector<String> &p_abs_paths) {
 	// someone else, not in the depot, ...). The save will fail, so say why.
 	Vector<String> still_read_only, checked_out;
 	for (const String &path : candidates) {
-		if (FileAccess::get_read_only_attribute(path)) {
+		if (P4Client::is_read_only(path)) {
 			still_read_only.push_back(_display(path));
 		} else {
 			checked_out.push_back(_display(path));
@@ -226,7 +226,7 @@ Error PerforceWriteHook::before_write(const String &p_path) {
 		// Writable files are already checked out (or not versioned); nothing to do.
 		// Refuse up front if checkout fails (locked by someone else), instead of
 		// failing later with a confusing "safe save failed" and a stray temp file.
-		if (FileAccess::get_read_only_attribute(path) && !checkout({ path })) {
+		if (P4Client::is_read_only(path) && !checkout({ path })) {
 			return ERR_FILE_NO_PERMISSION;
 		}
 	} else {

@@ -95,6 +95,11 @@ public:
 	// Sets a P4 variable for this user (`p4 set name=value`, stored by p4/P4V).
 	static Error set_variable(const String &p_name, const String &p_value);
 
+	// Whether Perforce has the file locally read-only (not checked out). Windows
+	// uses the read-only attribute; Linux/macOS use the owner write permission.
+	static bool is_read_only(const String &p_path);
+	static void make_writable(const String &p_path);
+
 	// Escapes the characters Perforce treats as wildcards/revision specifiers (@ # % *).
 	static String escape(const String &p_path);
 };

@@ -1,6 +1,7 @@
 # Building and sharing the Perforce editor
 
 How to build this Godot fork on Windows and get it to your team.
+**On Linux?** Jump to [Building on Linux](#building-on-linux).
 
 **Only one person has to build.** Teammates just get the finished `.exe` and
 don't need any of the build tools.
@@ -160,6 +161,75 @@ The Perforce changes are small and almost all live in `modules/perforce/`, so
 conflicts are rare. Only the team's builder needs to do this. Everyone else
 just gets the new zip. Upgrade the whole team at once, since newer Godot versions
 can update project files in ways older editors don't understand.
+
+## Building on Linux
+
+The same source builds on Linux; Perforce support works the same way there.
+
+### 1. Install the build tools (once)
+
+Ubuntu / Debian / Mint:
+
+```bash
+sudo apt-get install -y build-essential scons pkg-config git libx11-dev libxcursor-dev libxinerama-dev libgl1-mesa-dev libglu1-mesa-dev libasound2-dev libpulse-dev libudev-dev libxi-dev libxrandr-dev libwayland-dev
+```
+
+Fedora:
+
+```bash
+sudo dnf install -y scons pkgconfig git gcc-c++ libstdc++-static libatomic-static libX11-devel libXcursor-devel libXrandr-devel libXinerama-devel libXi-devel wayland-devel mesa-libGL-devel mesa-libGLU-devel alsa-lib-devel pulseaudio-libs-devel libudev-devel
+```
+
+Arch / Manjaro:
+
+```bash
+sudo pacman -S --needed scons pkgconf gcc git libxcursor libxinerama libxi libxrandr wayland-utils mesa glu libglvnd alsa-lib pulseaudio
+```
+
+If your distribution's SCons is old, use `python3 -m pip install --user scons` instead.
+
+### 2. Get the source and build
+
+```bash
+git clone -b perforce https://github.com/advladim/godot.git godot-perforce
+cd godot-perforce
+BUILD_NAME=perforce scons platform=linuxbsd target=editor production=yes accesskit=no
+```
+
+This takes 15–40 minutes the first time (add `-j4` to limit CPU use). The
+editor ends up at `bin/godot.linuxbsd.editor.x86_64`. Give it a clear name and
+run it:
+
+```bash
+cp bin/godot.linuxbsd.editor.x86_64 ~/godot_perforce_linux
+~/godot_perforce_linux
+```
+
+### 3. Install the Perforce command line client
+
+Godot calls `p4` to talk to Perforce. P4V for Linux doesn't always include it,
+so download **Helix Core Command-Line Client (P4)** for Linux from
+<https://www.perforce.com/downloads/helix-command-line-client-p4>, then:
+
+```bash
+chmod +x p4
+sudo mv p4 /usr/local/bin/
+p4 -V
+p4 set P4IGNORE=.p4ignore
+```
+
+Set up the connection once (`p4 set P4PORT=...`, `p4 set P4USER=...`,
+`p4 set P4CLIENT=...`) or log in through P4V; the editor uses the same
+settings. On Linux, `p4 set` stores them in `~/.p4enviro`.
+
+### Scene merge tool on Linux
+
+The equivalent of `godot-merge.bat` is a small script:
+
+```bash
+#!/bin/sh
+exec ~/godot_perforce_linux --headless --merge-scene "$1" "$2" "$3" "$4"
+```
 
 ## Running the tests
 

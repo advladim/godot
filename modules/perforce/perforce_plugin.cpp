@@ -654,8 +654,8 @@ void PerforcePlugin::_unlock_cache_folder(const String &p_dir) {
 	}
 	for (const String &file : da->get_files()) {
 		const String path = p_dir.path_join(file);
-		if (FileAccess::get_read_only_attribute(path)) {
-			FileAccess::set_read_only_attribute(path, false);
+		if (P4Client::is_read_only(path)) {
+			P4Client::make_writable(path);
 		}
 	}
 	for (const String &dir : da->get_directories()) {
