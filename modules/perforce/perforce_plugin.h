@@ -62,6 +62,7 @@ class PerforcePlugin : public EditorPlugin {
 	Timer *flush_timer = nullptr;
 	Timer *refresh_timer = nullptr; // Debounces refreshes after activity.
 	Timer *poll_timer = nullptr; // Periodically checks for newer files on the server.
+	Timer *reconnect_timer = nullptr; // While offline: tries to reach the server again.
 
 	ConfirmationDialog *connection_dialog = nullptr;
 	Label *connection_message = nullptr;
@@ -84,6 +85,7 @@ class PerforcePlugin : public EditorPlugin {
 	Vector<ObjectID> owned_nodes; // Everything created above, freed in the destructor if still unowned.
 
 	bool connected = false;
+	bool offline_reported = false; // Offline message already shown (don't repeat it every retry).
 	String project_root;
 	String workspace_name;
 
@@ -157,6 +159,14 @@ class PerforcePlugin : public EditorPlugin {
 	void _login_required(const String &p_message);
 	void _activity(const String &p_message, int p_level);
 	void _flush_pending();
+	void _go_offline(const String &p_message);
+	void _reconnect();
+	void _update_offline_status();
+	String _offline_file() const;
+	void _save_offline_work();
+	void _load_offline_work();
+	void _task_send_offline_work(const Dictionary &p_work);
+	void _send_offline_work_done(const Dictionary &p_result);
 	void _task_flush();
 	void _wait_for_flush();
 	void _flush_now();

@@ -43,6 +43,25 @@ Right-clicking nodes in the **Scene** tree offers **Check Out Scene** and
 
 If Perforce is busy with something else, the action runs as soon as it's done.
 
+## When the server is down
+
+The editor keeps working. If the Perforce server can't be reached (it's down,
+the VPN dropped, no internet), the panel shows **Offline** and:
+
+- Saving never waits for the server: files are made writable and saved
+  straight away.
+- Every edit, new file, delete, rename and folder move is remembered, even if
+  you close the editor (`.godot/editor/perforce_offline.json`).
+- The editor tries to reconnect every 30 seconds. Once the server is back,
+  everything is sent to Perforce automatically: renames and moves become real
+  moves (history is kept), and files are only checked out if they really
+  changed. The Activity log says what was sent.
+- If a teammate locked a file you changed while offline, you're told; your
+  changes stay on disk.
+
+The same happens for the first few seconds after opening a project, while the
+editor checks the connection, so a dead server never slows down startup.
+
 ## Automatic checkout
 
 On by default. To turn it off, open the settings button (the wrench) in the

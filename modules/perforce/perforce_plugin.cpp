@@ -38,6 +38,7 @@
 #include "core/config/project_settings.h"
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
+#include "core/io/json.h"
 #include "core/object/callable_mp.h"
 #include "core/object/class_db.h"
 #include "editor/editor_interface.h"
@@ -228,12 +229,28 @@ void PerforcePlugin::_connect_done(const Dictionary &p_result) {
 	}
 
 	connected = status == PerforceDock::STATUS_CONNECTED;
-	if (workspace_name.is_empty()) {
+	const bool offline = status == PerforceDock::STATUS_OFFLINE;
+	if (offline) {
+		// The server is unreachable: keep working offline and retry in the background.
+		// Harmless if the project isn't in Perforce after all: the first successful
+		// connection says so, and the remembered changes are dropped.
+		_install_hook();
+		hook->set_offline(true);
+		reconnect_timer->start();
+	} else if (workspace_name.is_empty()) {
 		_remove_hook();
+		DirAccess::remove_absolute(_offline_file()); // Not a Perforce project: nothing to send later.
 	} else {
 		_install_hook(); // Also when logged out: it will ask for a login when it needs one.
-		if (status == PerforceDock::STATUS_CONNECTED) {
+		if (connected) {
+			hook->set_offline(false);
+			reconnect_timer->stop();
+			offline_reported = false;
+			EditorSettings::get_singleton()->set_project_metadata("perforce", "last_workspace", workspace_name);
 			_ensure_p4ignore();
+			if (hook->get_offline_work_count() > 0) {
+				_start_task(callable_mp(this, &PerforcePlugin::_task_send_offline_work).bind(hook->take_offline_work()), TTR("Sending offline changes to Perforce..."), true);
+			}
 		}
 	}
 
@@ -251,8 +268,19 @@ void PerforcePlugin::_connect_done(const Dictionary &p_result) {
 		} break;
 		case PerforceDock::STATUS_OFFLINE: {
 			const String server = p_result.get("server", String());
-			dock->set_status(status, vformat(TTR("Can't reach the Perforce server %s. Files can't be checked out."), server.is_empty() ? TTR("(no server set)") : server));
+			if (hook) {
+				_update_offline_status();
+			} else {
+				dock->set_status(status, vformat(TTR("Can't reach the Perforce server %s."), server.is_empty() ? TTR("(no server set)") : server));
+			}
+			if (offline_reported) {
+				break; // Still offline after a retry; already explained.
+			}
+			offline_reported = true;
 			dock->add_log(message, PerforceDock::LOG_ERROR);
+			if (hook) {
+				dock->add_log(TTR("Working offline: saving still works, and every change is remembered and sent to Perforce automatically when the server is back. Retrying every 30 seconds."), PerforceDock::LOG_WARNING);
+			}
 			if (message.contains("specified class was not found")) {
 				// Winsock error 10109: the p4 program can't use the network at all on this PC.
 				dock->add_log(TTR("This is a Windows networking problem on this PC, not a Perforce or Godot one: the p4 command line program can't open network connections (P4V may still work, it doesn't use p4). Fix: open a Command Prompt as administrator, run \"netsh winsock reset\", and restart the PC. If a VPN or security program is installed, check whether it blocks p4.exe."), PerforceDock::LOG_WARNING);
@@ -291,6 +319,8 @@ void PerforcePlugin::_task_refresh() {
 	// Files opened in this project.
 	P4Result opened = P4Client::run({ "fstat", "-Ro", spec });
 	result["login_required"] = opened.login_required;
+	result["connection_failed"] = opened.connection_failed;
+	result["connection_message"] = opened.get_messages();
 	Array files;
 	PackedStringArray opened_local;
 	for (const P4Result::Record &rec : opened.records) {
@@ -322,6 +352,10 @@ void PerforcePlugin::_task_refresh() {
 
 void PerforcePlugin::_refresh_done(const Dictionary &p_result) {
 	_finish_task();
+	if ((bool)p_result["connection_failed"]) {
+		_go_offline(p_result["connection_message"]);
+		return;
+	}
 	if ((bool)p_result["login_required"]) {
 		_login_required(String());
 		return;
@@ -830,7 +864,11 @@ void PerforcePlugin::_install_hook() {
 	if (hook) {
 		return;
 	}
-	hook = memnew(PerforceWriteHook(project_root, callable_mp(this, &PerforcePlugin::_login_required), callable_mp(this, &PerforcePlugin::_activity)));
+	hook = memnew(PerforceWriteHook(project_root, callable_mp(this, &PerforcePlugin::_login_required), callable_mp(this, &PerforcePlugin::_activity), callable_mp(this, &PerforcePlugin::_go_offline)));
+	// Until a connection check succeeds, don't let saves wait for the server:
+	// remember changes and hand them to Perforce once connected.
+	hook->set_offline(true);
+	_load_offline_work();
 	FileSystemWriteHook::set_singleton(hook);
 	_apply_auto_checkout();
 	if (flush_timer->is_inside_tree()) {
@@ -844,6 +882,7 @@ void PerforcePlugin::_remove_hook() {
 	}
 	flush_timer->stop();
 	_flush_now();
+	_save_offline_work(); // Work done offline survives an editor restart.
 	if (FileSystemWriteHook::get_singleton() == hook) {
 		FileSystemWriteHook::set_singleton(nullptr);
 	}
@@ -862,6 +901,10 @@ void PerforcePlugin::_activity(const String &p_message, int p_level) {
 
 // Runs queued `p4 add` / `p4 edit` commands on a worker thread, so saving never waits for the server.
 void PerforcePlugin::_flush_pending() {
+	if (hook && hook->take_offline_dirty()) {
+		_save_offline_work();
+		_update_offline_status();
+	}
 	if (!hook || !hook->has_pending()) {
 		return;
 	}
@@ -901,6 +944,189 @@ void PerforcePlugin::_apply_auto_checkout() {
 	if (hook) {
 		hook->set_auto_checkout(_is_auto_checkout());
 	}
+}
+
+// --- Offline mode ----------------------------------------------------------
+
+// A command found the server unreachable in the middle of a session.
+void PerforcePlugin::_go_offline(const String &p_message) {
+	if (!hook) {
+		return;
+	}
+	hook->set_offline(true);
+	const bool was_connected = connected;
+	connected = false;
+	reconnect_timer->start();
+	_update_offline_status();
+	if (was_connected || !offline_reported) {
+		offline_reported = true;
+		dock->add_log(TTR("Lost the connection to the Perforce server.") + (p_message.is_empty() ? String() : " " + p_message), PerforceDock::LOG_ERROR);
+		dock->add_log(TTR("Working offline: saving still works, and every change is remembered and sent to Perforce automatically when the server is back. Retrying every 30 seconds."), PerforceDock::LOG_WARNING);
+		EditorToaster::get_singleton()->popup_str(TTR("Perforce: server unreachable, working offline. Changes will be sent when it's back."), EditorToaster::SEVERITY_WARNING);
+	}
+}
+
+void PerforcePlugin::_reconnect() {
+	if (connected || task != WorkerThreadPool::INVALID_TASK_ID) {
+		return;
+	}
+	_apply_connection_settings();
+	_start_task(callable_mp(this, &PerforcePlugin::_task_connect), String());
+}
+
+void PerforcePlugin::_update_offline_status() {
+	if (!hook || connected || dock->get_status() == PerforceDock::STATUS_LOGIN_REQUIRED) {
+		return;
+	}
+	const int count = hook->get_offline_work_count();
+	dock->set_status(PerforceDock::STATUS_OFFLINE, count == 0 ? TTR("Offline: can't reach the Perforce server. Saving still works; changes are sent when it's back.") : vformat(TTRN("Offline: %d change waiting to be sent to Perforce when the server is back.", "Offline: %d changes waiting to be sent to Perforce when the server is back.", count), count));
+}
+
+String PerforcePlugin::_offline_file() const {
+	return project_root.path_join(".godot/editor/perforce_offline.json");
+}
+
+void PerforcePlugin::_save_offline_work() {
+	if (!hook) {
+		return;
+	}
+	if (hook->get_offline_work_count() == 0) {
+		if (FileAccess::exists(_offline_file())) {
+			DirAccess::remove_absolute(_offline_file());
+		}
+		return;
+	}
+	Ref<FileAccess> file = FileAccess::open(_offline_file(), FileAccess::WRITE);
+	if (file.is_valid()) {
+		file->store_string(JSON::stringify(hook->get_offline_work(), "\t"));
+	}
+}
+
+void PerforcePlugin::_load_offline_work() {
+	if (!hook || !FileAccess::exists(_offline_file())) {
+		return;
+	}
+	const Variant work = JSON::parse_string(FileAccess::get_file_as_string(_offline_file()));
+	if (work.get_type() == Variant::DICTIONARY) {
+		hook->add_offline_work(work);
+	}
+}
+
+// Hands everything done offline to Perforce: moves first (keeping history), then
+// `p4 reconcile` opens edited/new/deleted files (only if they really changed).
+void PerforcePlugin::_task_send_offline_work(const Dictionary &p_work) {
+	Dictionary result;
+	Dictionary unsent;
+	PackedStringArray unsent_files;
+	PackedStringArray unsent_moves;
+	int moved = 0;
+	bool went_offline = false;
+
+	const PackedStringArray moves = p_work.get("moves", PackedStringArray());
+	PackedStringArray files = p_work.get("files", PackedStringArray());
+	for (int i = 0; i + 1 < moves.size(); i += 2) {
+		const String from = moves[i], to = moves[i + 1];
+		const bool folder = DirAccess::dir_exists_absolute(to);
+		const String from_spec = P4Client::escape(from) + (folder ? "/..." : "");
+		const String to_spec = P4Client::escape(to) + (folder ? "/..." : "");
+		if (went_offline) {
+			unsent_moves.push_back(from);
+			unsent_moves.push_back(to);
+			continue;
+		}
+		// -k: the files were already moved on disk; only tell the server.
+		P4Result edit = P4Client::run({ "edit", "-k", from_spec });
+		P4Result move = P4Client::run({ "move", "-k", from_spec, to_spec });
+		if (edit.connection_failed || move.connection_failed) {
+			went_offline = true;
+			unsent_moves.push_back(from);
+			unsent_moves.push_back(to);
+		} else if (!move.records.is_empty()) {
+			moved += move.records.size();
+		} else {
+			// Not versioned (or couldn't move): treat as a delete + add.
+			files.push_back(from);
+			files.push_back(to);
+		}
+	}
+
+	Vector<String> specs;
+	for (const String &file : files) {
+		specs.push_back(P4Client::escape(file) + (DirAccess::dir_exists_absolute(file) ? "/..." : ""));
+	}
+	int edited = 0, added = 0, deleted = 0;
+	if (!went_offline && !specs.is_empty()) {
+		P4Result reconcile = P4Client::run_files({ "reconcile", "-e", "-a", "-d" }, specs);
+		if (reconcile.connection_failed) {
+			went_offline = true;
+		}
+		for (const P4Result::Record &rec : reconcile.records) {
+			const String action = P4Result::field(rec, "action");
+			if (action == "edit") {
+				edited++;
+			} else if (action == "add") {
+				added++;
+			} else if (action == "delete") {
+				deleted++;
+			}
+		}
+		// Files someone else has locked were changed here but can't be checked out: say so.
+		PackedStringArray locked;
+		for (const String &warning : reconcile.warnings) {
+			if (warning.contains("can't edit exclusive")) {
+				locked.push_back(warning.get_slicec(' ', 0).get_file());
+			}
+		}
+		Vector<String> holders;
+		for (const String &info : reconcile.infos) {
+			const int at = info.find("also opened by ");
+			if (at != -1 && !holders.has(info.substr(at + 15).get_slicec('@', 0))) {
+				holders.push_back(info.substr(at + 15).get_slicec('@', 0));
+			}
+		}
+		result["locked"] = locked;
+		result["holders"] = String(", ").join(holders);
+		result["messages"] = reconcile.errors.is_empty() ? String() : reconcile.get_messages();
+	}
+	if (went_offline) {
+		unsent_files = PackedStringArray(files);
+	}
+	unsent["files"] = unsent_files;
+	unsent["moves"] = unsent_moves;
+
+	result["unsent"] = unsent;
+	result["went_offline"] = went_offline;
+	result["edited"] = edited;
+	result["added"] = added;
+	result["deleted"] = deleted;
+	result["moved"] = moved;
+	callable_mp(this, &PerforcePlugin::_send_offline_work_done).call_deferred(result);
+}
+
+void PerforcePlugin::_send_offline_work_done(const Dictionary &p_result) {
+	_finish_task();
+	if (hook) {
+		hook->add_offline_work(p_result["unsent"]); // Whatever didn't make it, for the next try.
+	}
+	if ((bool)p_result["went_offline"]) {
+		_go_offline(String());
+		_save_offline_work();
+		return;
+	}
+	const int edited = p_result["edited"], added = p_result["added"], deleted = p_result["deleted"], moved = p_result["moved"];
+	dock->add_log(vformat(TTR("Sent offline changes to Perforce: %d checked out, %d added, %d deleted, %d moved (files that didn't really change were left alone)."), edited, added, deleted, moved), PerforceDock::LOG_SUCCESS);
+	const String messages = p_result.get("messages", String());
+	if (!messages.is_empty()) {
+		dock->add_log(messages, PerforceDock::LOG_WARNING);
+	}
+	const PackedStringArray locked = p_result.get("locked", PackedStringArray());
+	if (!locked.is_empty()) {
+		const String message = vformat(TTR("You changed %s while offline, but it's locked by %s, so it couldn't be checked out. Your changes are still on disk; ask them to submit or revert it, then check it out (right-click > Perforce: Check Out)."), String(", ").join(locked), String(p_result.get("holders", String())));
+		dock->add_log(message, PerforceDock::LOG_ERROR);
+		EditorToaster::get_singleton()->popup_str("Perforce: " + message, EditorToaster::SEVERITY_WARNING);
+	}
+	_save_offline_work();
+	_refresh();
 }
 
 // --- Right-click menus ---------------------------------------------------
@@ -1102,6 +1328,7 @@ void PerforcePlugin::_notification(int p_what) {
 			add_child(flush_timer);
 			add_child(refresh_timer);
 			add_child(poll_timer);
+			add_child(reconnect_timer);
 			filesystem_menu = Ref<PerforceContextMenu>(memnew(PerforceContextMenu(get_instance_id(), true)));
 			scene_tabs_menu = Ref<PerforceContextMenu>(memnew(PerforceContextMenu(get_instance_id(), true)));
 			scene_tree_menu = Ref<PerforceContextMenu>(memnew(PerforceContextMenu(get_instance_id(), false)));
@@ -1156,6 +1383,10 @@ PerforcePlugin::PerforcePlugin() {
 	refresh_timer->set_wait_time(1.5);
 	refresh_timer->set_one_shot(true);
 	refresh_timer->connect("timeout", callable_mp(this, &PerforcePlugin::_refresh));
+
+	reconnect_timer = memnew(Timer);
+	reconnect_timer->set_wait_time(30);
+	reconnect_timer->connect("timeout", callable_mp(this, &PerforcePlugin::_reconnect));
 
 	poll_timer = memnew(Timer);
 	poll_timer->set_wait_time(120);
@@ -1226,7 +1457,7 @@ PerforcePlugin::PerforcePlugin() {
 	hint->set_modulate(Color(1, 1, 1, 0.65));
 	vbox->add_child(hint);
 
-	for (Node *node : { (Node *)dock, (Node *)connection_dialog, (Node *)confirm_dialog, (Node *)resolve_dialog, (Node *)flush_timer, (Node *)refresh_timer, (Node *)poll_timer }) {
+	for (Node *node : { (Node *)dock, (Node *)connection_dialog, (Node *)confirm_dialog, (Node *)resolve_dialog, (Node *)flush_timer, (Node *)refresh_timer, (Node *)poll_timer, (Node *)reconnect_timer }) {
 		owned_nodes.push_back(node->get_instance_id());
 	}
 

@@ -114,6 +114,77 @@ void PerforceWriteHook::_queue_edit(const String &p_abs_path) {
 	}
 }
 
+void PerforceWriteHook::_record_offline(const String &p_abs_path) {
+	MutexLock lock(pending_mutex);
+	pending_adds.erase(p_abs_path);
+	pending_edits.erase(p_abs_path);
+	offline_changes.insert(p_abs_path);
+	offline_dirty = true;
+}
+
+// A command couldn't reach the server: switch to offline mode (once) and tell the plugin.
+bool PerforceWriteHook::_went_offline(const P4Result &p_result) {
+	if (!p_result.connection_failed) {
+		return false;
+	}
+	if (!offline.is_set()) {
+		offline.set();
+		on_offline.call_deferred(p_result.get_messages());
+	}
+	return true;
+}
+
+void PerforceWriteHook::set_offline(bool p_offline) {
+	offline.set_to(p_offline);
+}
+
+Dictionary PerforceWriteHook::get_offline_work() {
+	MutexLock lock(pending_mutex);
+	PackedStringArray files;
+	for (const String &path : offline_changes) {
+		files.push_back(path);
+	}
+	Dictionary work;
+	work["files"] = files;
+	work["moves"] = PackedStringArray(offline_moves);
+	return work;
+}
+
+Dictionary PerforceWriteHook::take_offline_work() {
+	Dictionary work = get_offline_work();
+	MutexLock lock(pending_mutex);
+	offline_changes.clear();
+	offline_moves.clear();
+	offline_dirty = true;
+	return work;
+}
+
+void PerforceWriteHook::add_offline_work(const Dictionary &p_work) {
+	MutexLock lock(pending_mutex);
+	const PackedStringArray files = p_work.get("files", PackedStringArray());
+	for (const String &path : files) {
+		offline_changes.insert(path);
+	}
+	const PackedStringArray moves = p_work.get("moves", PackedStringArray());
+	for (int i = 0; i + 1 < moves.size(); i += 2) {
+		offline_moves.push_back(moves[i]);
+		offline_moves.push_back(moves[i + 1]);
+	}
+	offline_dirty = true;
+}
+
+int PerforceWriteHook::get_offline_work_count() {
+	MutexLock lock(pending_mutex);
+	return offline_changes.size() + offline_moves.size() / 2;
+}
+
+bool PerforceWriteHook::take_offline_dirty() {
+	MutexLock lock(pending_mutex);
+	const bool dirty = offline_dirty;
+	offline_dirty = false;
+	return dirty;
+}
+
 void PerforceWriteHook::set_auto_checkout(bool p_enabled) {
 	auto_checkout.set_to(p_enabled);
 }
@@ -141,14 +212,15 @@ void PerforceWriteHook::_report(const String &p_what, const P4Result &p_result) 
 		on_login_required.call_deferred(p_result.get_messages());
 		return;
 	}
-	if (p_result.errors.is_empty()) {
-		return;
+	if (p_result.errors.is_empty() || p_result.connection_failed) {
+		return; // Going offline is reported once, by the plugin.
 	}
 	_log(vformat("%s failed: %s", p_what, p_result.get_messages()), PerforceDock::LOG_ERROR);
 }
 
 P4Result::Record PerforceWriteHook::_fstat(const String &p_abs_path) {
 	P4Result result = P4Client::run({ "fstat", P4Client::escape(p_abs_path) });
+	_went_offline(result);
 	if (result.login_required) {
 		_report("Checking " + _display(p_abs_path), result);
 	}
@@ -172,6 +244,14 @@ bool PerforceWriteHook::checkout(const Vector<String> &p_abs_paths) {
 
 	P4Result result = P4Client::run_files({ "edit" }, to_edit);
 	_report("Checking out files", result);
+	if (_went_offline(result)) {
+		// The server just went away: don't block the save, check them out later.
+		for (const String &path : candidates) {
+			P4Client::make_writable(path);
+			_record_offline(path);
+		}
+		return true;
+	}
 	if (result.login_required) {
 		return false;
 	}
@@ -241,6 +321,12 @@ void PerforceWriteHook::_flush_edits() {
 	if (to_edit.is_empty()) {
 		return;
 	}
+	if (offline.is_set()) {
+		for (const String &path : to_edit) {
+			_record_offline(path);
+		}
+		return;
+	}
 
 	Vector<String> escaped;
 	for (const String &path : to_edit) {
@@ -248,6 +334,12 @@ void PerforceWriteHook::_flush_edits() {
 	}
 	P4Result result = P4Client::run_files({ "edit" }, escaped);
 	_report("Checking out files", result);
+	if (_went_offline(result)) {
+		for (const String &path : to_edit) {
+			_record_offline(path);
+		}
+		return;
+	}
 	if (result.login_required) {
 		return;
 	}
@@ -310,10 +402,22 @@ void PerforceWriteHook::_flush_adds() {
 	if (to_add.is_empty()) {
 		return;
 	}
+	if (offline.is_set()) {
+		for (const String &path : to_add) {
+			_record_offline(path);
+		}
+		return;
+	}
 	// -f allows names with wildcard characters (e.g. "icon@2x.png"); paths are passed unescaped.
 	// Files excluded by P4IGNORE are skipped by p4 with a warning.
 	P4Result result = P4Client::run_files({ "add", "-f" }, to_add);
 	_report("Adding new files", result);
+	if (_went_offline(result)) {
+		for (const String &path : to_add) {
+			_record_offline(path);
+		}
+		return;
+	}
 
 	// Tagged output: one record per file opened for add.
 	Vector<String> added;
@@ -340,6 +444,14 @@ Error PerforceWriteHook::before_write(const String &p_path) {
 		return OK;
 	}
 	const bool automatic = auto_checkout.is_set();
+	if (offline.is_set() && automatic) {
+		// No server: never wait. Make it writable and hand it to Perforce later.
+		if (FileAccess::exists(path) && P4Client::is_read_only(path)) {
+			P4Client::make_writable(path);
+		}
+		_record_offline(path);
+		return OK;
+	}
 	if (!FileAccess::exists(path)) {
 		if (automatic) {
 			// p4 can only add files that exist; queue it until the file has been written.
@@ -388,7 +500,18 @@ Error PerforceWriteHook::before_remove(const String &p_path) {
 		pending_adds.erase(path);
 	}
 
-	P4Result::Record stat = _fstat(path);
+	P4Result::Record stat;
+	if (!offline.is_set()) {
+		stat = _fstat(path);
+	}
+	if (offline.is_set()) {
+		// Delete it locally (read-only files can't be deleted on Windows); Perforce gets it later.
+		if (P4Client::is_read_only(path)) {
+			P4Client::make_writable(path);
+		}
+		_record_offline(path);
+		return ERR_SKIP;
+	}
 	if (stat.is_empty()) {
 		return ERR_SKIP; // Not in Perforce.
 	}
@@ -472,8 +595,25 @@ Error PerforceWriteHook::before_rename(const String &p_from, const String &p_to)
 		return ERR_SKIP;
 	}
 
+	if (offline.is_set()) {
+		// Rename locally; it becomes a `p4 move` (keeping history) once the server is back.
+		MutexLock lock(pending_mutex);
+		pending_adds.erase(from);
+		offline_moves.push_back(from);
+		offline_moves.push_back(to);
+		offline_dirty = true;
+		return ERR_SKIP;
+	}
+
 	if (DirAccess::dir_exists_absolute(from)) {
 		P4Result tracked = P4Client::run({ "fstat", "-m1", P4Client::escape(from) + "/..." });
+		if (_went_offline(tracked)) {
+			MutexLock lock(pending_mutex);
+			offline_moves.push_back(from);
+			offline_moves.push_back(to);
+			offline_dirty = true;
+			return ERR_SKIP;
+		}
 		if (tracked.records.is_empty()) {
 			return ERR_SKIP; // Nothing versioned inside.
 		}
@@ -496,6 +636,13 @@ Error PerforceWriteHook::before_rename(const String &p_from, const String &p_to)
 	}
 
 	P4Result::Record stat = _fstat(from);
+	if (offline.is_set()) {
+		MutexLock lock(pending_mutex);
+		offline_moves.push_back(from);
+		offline_moves.push_back(to);
+		offline_dirty = true;
+		return ERR_SKIP;
+	}
 	const String action = P4Result::field(stat, "action");
 	if (stat.is_empty() || _is_deleted_action(action) || (action.is_empty() && _is_deleted_action(P4Result::field(stat, "headAction")))) {
 		// Not versioned: a normal rename, and the new name is a new file.
@@ -538,12 +685,16 @@ void PerforceWriteHook::prepare_writes(const Vector<String> &p_paths) {
 			P4Client::make_writable(path);
 		}
 		if (auto_checkout.is_set()) {
-			_queue_edit(path);
+			if (offline.is_set()) {
+				_record_offline(path);
+			} else {
+				_queue_edit(path);
+			}
 		}
 	}
 }
 
-PerforceWriteHook::PerforceWriteHook(const String &p_project_root, const Callable &p_on_login_required, const Callable &p_on_activity) {
+PerforceWriteHook::PerforceWriteHook(const String &p_project_root, const Callable &p_on_login_required, const Callable &p_on_activity, const Callable &p_on_offline) {
 	project_root = p_project_root.replace_char('\\', '/').simplify_path();
 	if (!project_root.ends_with("/")) {
 		project_root += "/";
@@ -554,5 +705,6 @@ PerforceWriteHook::PerforceWriteHook(const String &p_project_root, const Callabl
 	ignored_root = project_root + ".godot/";
 	on_login_required = p_on_login_required;
 	on_activity = p_on_activity;
+	on_offline = p_on_offline;
 	auto_checkout.set();
 }

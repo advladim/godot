@@ -38,6 +38,7 @@
 #include "core/templates/hash_set.h"
 #include "core/templates/safe_refcount.h"
 #include "core/variant/callable.h"
+#include "core/variant/dictionary.h"
 
 // Keeps Perforce in sync with what the editor does to project files:
 // checks out read-only files before they are written, marks new files for
@@ -57,6 +58,15 @@ class PerforceWriteHook : public FileSystemWriteHook {
 
 	SafeFlag auto_checkout;
 
+	// Offline mode: the server can't be reached (or the first connection check
+	// hasn't finished). Nothing waits for Perforce; changes are remembered and
+	// handed to Perforce once it's back (see take_offline_work()).
+	SafeFlag offline;
+	HashSet<String> offline_changes; // Edited, added or deleted files (absolute).
+	Vector<String> offline_moves; // Pairs: from, to (files or folders).
+	bool offline_dirty = false;
+	Callable on_offline; // Called deferred with the p4 error when a command finds the server gone.
+
 	Callable on_login_required; // Called deferred with the p4 error message.
 	Callable on_activity; // Called deferred with (message, PerforceDock::LogLevel).
 
@@ -66,6 +76,8 @@ class PerforceWriteHook : public FileSystemWriteHook {
 	String _key(const String &p_abs_path) const;
 	bool _is_metadata(const String &p_abs_path) const;
 	void _queue_edit(const String &p_abs_path);
+	void _record_offline(const String &p_abs_path);
+	bool _went_offline(const P4Result &p_result);
 	void _flush_adds();
 	void _flush_edits();
 	String _display(const String &p_abs_path) const;
@@ -85,6 +97,15 @@ public:
 	bool is_auto_checkout() const { return auto_checkout.is_set(); }
 	// Files currently opened in this workspace (absolute paths), from a refresh.
 	void set_known_opened(const Vector<String> &p_abs_paths);
+
+	void set_offline(bool p_offline);
+	bool is_offline() const { return offline.is_set(); }
+	// { "files": PackedStringArray, "moves": PackedStringArray (from, to pairs) }.
+	Dictionary get_offline_work();
+	Dictionary take_offline_work(); // Same, and clears it.
+	void add_offline_work(const Dictionary &p_work); // Restores saved or unfinished work.
+	int get_offline_work_count();
+	bool take_offline_dirty(); // True once after the offline work changed (to save it to disk).
 	// Checks out every managed, read-only file in the list with a single command.
 	// Returns false if some of them are still read-only afterwards.
 	bool checkout(const Vector<String> &p_abs_paths);
@@ -97,5 +118,5 @@ public:
 	// While true on the current thread, hooks do nothing (used for our own file operations).
 	static thread_local bool suppressed;
 
-	PerforceWriteHook(const String &p_project_root, const Callable &p_on_login_required, const Callable &p_on_activity);
+	PerforceWriteHook(const String &p_project_root, const Callable &p_on_login_required, const Callable &p_on_activity, const Callable &p_on_offline);
 };
