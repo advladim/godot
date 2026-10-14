@@ -46,11 +46,13 @@
 #include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/box_container.h"
+#include "scene/gui/button.h"
 #include "scene/gui/check_box.h"
 #include "scene/gui/dialogs.h"
 #include "scene/gui/grid_container.h"
 #include "scene/gui/label.h"
 #include "scene/gui/line_edit.h"
+#include "scene/gui/popup_menu.h"
 #include "scene/main/timer.h"
 #include "scene/scene_string_names.h"
 
@@ -72,9 +74,11 @@ static String _get_setting(const String &p_key) {
 	return EditorSettings::get_singleton()->get_project_metadata("perforce", p_key, String());
 }
 
+// Files the structure-aware merger handles (instead of Perforce's line merge).
 static bool _is_text_scene(const String &p_path) {
 	const String ext = p_path.get_extension().to_lower();
-	return ext == "tscn" || ext == "tres";
+	const String name = p_path.get_file().to_lower();
+	return ext == "tscn" || ext == "tres" || name == "project.godot" || name == "export_presets.cfg";
 }
 
 static String _local_to_res(const String &p_local_path) {
@@ -158,6 +162,7 @@ void PerforcePlugin::_task_connect() {
 	// If the .godot cache was ever submitted, its files are read-only; make them
 	// all writable up front so no editor write ever fails on them.
 	_unlock_cache_folder(project_root.path_join(".godot"));
+	result["server"] = conn.port.is_empty() ? P4Client::get_variable("P4PORT") : conn.port;
 
 	P4Result info = P4Client::run({ "info" });
 	if (info.not_installed) {
@@ -245,8 +250,15 @@ void PerforcePlugin::_connect_done(const Dictionary &p_result) {
 			_show_connection_dialog(message);
 		} break;
 		case PerforceDock::STATUS_OFFLINE: {
-			dock->set_status(status, vformat(TTR("Can't reach the Perforce server %s. Files can't be checked out."), p_result.get("server", String())));
+			const String server = p_result.get("server", String());
+			dock->set_status(status, vformat(TTR("Can't reach the Perforce server %s. Files can't be checked out."), server.is_empty() ? TTR("(no server set)") : server));
 			dock->add_log(message, PerforceDock::LOG_ERROR);
+			if (message.contains("specified class was not found")) {
+				// Winsock error 10109: the p4 program can't use the network at all on this PC.
+				dock->add_log(TTR("This is a Windows networking problem on this PC, not a Perforce or Godot one: the p4 command line program can't open network connections (P4V may still work, it doesn't use p4). Fix: open a Command Prompt as administrator, run \"netsh winsock reset\", and restart the PC. If a VPN or security program is installed, check whether it blocks p4.exe."), PerforceDock::LOG_WARNING);
+			} else {
+				dock->add_log(vformat(TTR("Check the server address with your team (P4V: Connection > Open Connection). To test outside Godot, open a Command Prompt and run: p4 -p %s info"), server.is_empty() ? String("<server:port>") : server), PerforceDock::LOG_WARNING);
+			}
 		} break;
 		case PerforceDock::STATUS_NO_P4: {
 			dock->set_status(status, TTR("Perforce command line client (p4) not found."));
@@ -596,6 +608,85 @@ void PerforcePlugin::_revert_done(const Dictionary &p_result) {
 	_refresh();
 }
 
+// --- Revert unchanged ------------------------------------------------------
+
+void PerforcePlugin::_revert_unchanged() {
+	_start_task(callable_mp(this, &PerforcePlugin::_task_revert_unchanged), TTR("Reverting unchanged files..."), true);
+}
+
+void PerforcePlugin::_task_revert_unchanged() {
+	// -a: only files whose content is identical to the depot revision.
+	P4Result revert = P4Client::run({ "revert", "-a", _depot_spec() });
+	Dictionary result;
+	result["count"] = revert.records.size();
+	result["errors"] = revert.errors.is_empty() ? String() : revert.get_messages();
+	result["login_required"] = revert.login_required;
+	callable_mp(this, &PerforcePlugin::_revert_unchanged_done).call_deferred(result);
+}
+
+void PerforcePlugin::_revert_unchanged_done(const Dictionary &p_result) {
+	_finish_task();
+	if ((bool)p_result["login_required"]) {
+		_login_required(String());
+		return;
+	}
+	const int count = p_result["count"];
+	const String errors = p_result["errors"];
+	if (!errors.is_empty()) {
+		dock->add_log(TTR("Revert Unchanged:") + " " + errors, PerforceDock::LOG_ERROR);
+	} else if (count == 0) {
+		dock->add_log(TTR("No unchanged files to revert."), PerforceDock::LOG_INFO);
+	} else {
+		dock->add_log(vformat(TTRN("Reverted %d unchanged file.", "Reverted %d unchanged files.", count), count), PerforceDock::LOG_SUCCESS);
+	}
+	EditorFileSystem::get_singleton()->scan_changes();
+	_refresh();
+}
+
+// --- Workspace chooser -----------------------------------------------------
+
+// Lists the user's workspaces on the server so nobody has to type the name.
+void PerforcePlugin::_choose_workspace() {
+	const P4Connection saved = P4Client::get_connection();
+	P4Connection conn = saved;
+	conn.port = port_edit->get_text().strip_edges();
+	conn.user = user_edit->get_text().strip_edges();
+	conn.client = String();
+	P4Client::set_connection(conn);
+	const String user = conn.user.is_empty() ? P4Client::get_variable("P4USER") : conn.user;
+	P4Result clients = P4Client::run({ "clients", "-u", user });
+	P4Client::set_connection(saved);
+
+	if (clients.records.is_empty()) {
+		String why = clients.login_required ? TTR("Log in first: enter your password and click Connect, then try again.") : clients.get_messages();
+		if (why.is_empty()) {
+			why = vformat(TTR("No workspaces found for user \"%s\". Create one in P4V first."), user);
+		}
+		connection_message->set_text(why);
+		connection_message->show();
+		return;
+	}
+
+	workspace_menu->clear();
+	for (const P4Result::Record &client : clients.records) {
+		const String name = P4Result::field(client, "client");
+		const String root = P4Result::field(client, "Root");
+		String label = name + "    " + root;
+		if (_is_inside(project_root, root)) {
+			label += "    " + TTR("(contains this project)");
+		}
+		workspace_menu->add_item(label);
+		workspace_menu->set_item_metadata(-1, name);
+	}
+	workspace_menu->reset_size();
+	workspace_menu->set_position(client_edit->get_screen_position() + Vector2(0, client_edit->get_size().y));
+	workspace_menu->popup();
+}
+
+void PerforcePlugin::_workspace_chosen(int p_index) {
+	client_edit->set_text(workspace_menu->get_item_metadata(workspace_menu->get_item_index(p_index)));
+}
+
 // --- Keeping the .godot cache out of Perforce ------------------------------
 
 // Every Perforce project needs a .p4ignore listing .godot/; create or fix it.
@@ -941,7 +1032,8 @@ void PerforcePlugin::_show_connection_dialog(const String &p_message) {
 	user_edit->set_text(_get_setting("user"));
 	user_edit->set_placeholder(P4Client::get_variable("P4USER"));
 	client_edit->set_text(_get_setting("client"));
-	client_edit->set_placeholder(workspace_name.is_empty() ? P4Client::get_variable("P4CLIENT") : workspace_name);
+	String client_hint = workspace_name.is_empty() ? P4Client::get_variable("P4CLIENT") : workspace_name;
+	client_edit->set_placeholder(client_hint.is_empty() ? TTR("Detected automatically, or click Choose...") : client_hint);
 	password_edit->clear();
 	auto_checkout_check->set_pressed(_is_auto_checkout());
 
@@ -952,6 +1044,12 @@ void PerforcePlugin::_show_connection_dialog(const String &p_message) {
 }
 
 void PerforcePlugin::_connection_dialog_confirmed() {
+	const String workspace = client_edit->get_text().strip_edges();
+	if (workspace.contains(":") || workspace.contains("\\") || workspace.contains("/")) {
+		// A common mistake: the workspace *folder* instead of its name.
+		callable_mp(this, &PerforcePlugin::_show_connection_dialog).call_deferred(vformat(TTR("\"%s\" looks like a folder. Workspace needs the workspace *name* (as shown in P4V's workspace dropdown, e.g. name_PC). Click \"Choose...\" to pick it, or leave it empty to detect it automatically."), workspace));
+		return;
+	}
 	EditorSettings::get_singleton()->set_project_metadata("perforce", "port", port_edit->get_text().strip_edges());
 	EditorSettings::get_singleton()->set_project_metadata("perforce", "user", user_edit->get_text().strip_edges());
 	EditorSettings::get_singleton()->set_project_metadata("perforce", "client", client_edit->get_text().strip_edges());
@@ -1047,6 +1145,7 @@ PerforcePlugin::PerforcePlugin() {
 	dock->connect("revert_requested", callable_mp(this, &PerforcePlugin::_revert));
 	dock->connect("submit_requested", callable_mp(this, &PerforcePlugin::_submit));
 	dock->connect("remove_cache_requested", callable_mp(this, &PerforcePlugin::_remove_cache));
+	dock->connect("revert_unchanged_requested", callable_mp(this, &PerforcePlugin::_revert_unchanged));
 	dock->connect("enable_p4ignore_requested", callable_mp(this, &PerforcePlugin::_enable_p4ignore));
 
 	flush_timer = memnew(Timer);
@@ -1095,7 +1194,23 @@ PerforcePlugin::PerforcePlugin() {
 	};
 	port_edit = add_field(TTR("Server:"));
 	user_edit = add_field(TTR("User:"));
-	client_edit = add_field(TTR("Workspace:"));
+	{
+		Label *label = memnew(Label(TTR("Workspace:")));
+		grid->add_child(label);
+		HBoxContainer *row = memnew(HBoxContainer);
+		row->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+		grid->add_child(row);
+		client_edit = memnew(LineEdit);
+		client_edit->set_h_size_flags(Control::SIZE_EXPAND_FILL);
+		row->add_child(client_edit);
+		Button *choose = memnew(Button(TTR("Choose...")));
+		choose->set_tooltip_text(TTR("List your workspaces on the server."));
+		choose->connect(SceneStringName(pressed), callable_mp(this, &PerforcePlugin::_choose_workspace));
+		row->add_child(choose);
+		workspace_menu = memnew(PopupMenu);
+		workspace_menu->connect(SceneStringName(id_pressed), callable_mp(this, &PerforcePlugin::_workspace_chosen));
+		row->add_child(workspace_menu);
+	}
 	password_edit = add_field(TTR("Password:"));
 	password_edit->set_secret(true);
 	password_edit->set_placeholder(TTR("Only needed when not logged in"));

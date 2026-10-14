@@ -228,7 +228,7 @@ The equivalent of `godot-merge.bat` is a small script:
 
 ```bash
 #!/bin/sh
-exec ~/godot_perforce_linux --headless --merge-scene "$1" "$2" "$3" "$4"
+exec ~/godot_perforce_linux --headless --merge-scene -- "$1" "$2" "$3" "$4"
 ```
 
 ## Running the tests

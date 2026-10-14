@@ -89,6 +89,7 @@ private:
 	Label *files_label = nullptr;
 	Tree *files_tree = nullptr;
 	Button *revert_button = nullptr;
+	Button *revert_unchanged_button = nullptr;
 	LineEdit *description_edit = nullptr;
 	Button *submit_button = nullptr;
 

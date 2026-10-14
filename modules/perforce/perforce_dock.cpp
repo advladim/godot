@@ -128,6 +128,7 @@ void PerforceDock::_update_ui() {
 
 	files_label->set_text(opened_count == 0 ? TTR("No files checked out. Saving a file checks it out automatically.") : vformat(TTRN("%d file checked out (default changelist):", "%d files checked out (default changelist):", opened_count), opened_count));
 	revert_button->set_disabled(!connected || busy || files_tree->get_next_selected(nullptr) == nullptr);
+	revert_unchanged_button->set_disabled(!connected || busy || opened_count == 0);
 	description_edit->set_editable(connected && !busy);
 	submit_button->set_disabled(!connected || busy || opened_count == 0 || description_edit->get_text().strip_edges().is_empty());
 	submit_button->set_tooltip_text(description_edit->get_text().strip_edges().is_empty() ? TTR("Enter a description first.") : TTR("Save all scenes and submit the checked out files of this project."));
@@ -278,6 +279,7 @@ void PerforceDock::_notification(int p_what) {
 			connection_button->set_button_icon(get_editor_theme_icon(SNAME("Tools")));
 			resolve_button->set_button_icon(get_editor_theme_icon(SNAME("StatusWarning")));
 			revert_button->set_button_icon(get_editor_theme_icon(SNAME("Close")));
+			revert_unchanged_button->set_button_icon(get_editor_theme_icon(SNAME("Clear")));
 			submit_button->set_button_icon(get_editor_theme_icon(SNAME("VCSCommit")));
 			setup_icon->set_texture(get_editor_theme_icon(SNAME("StatusWarning")));
 			setup_label->add_theme_color_override(SceneStringName(font_color), get_theme_color(SNAME("warning_color"), EditorStringName(Editor)));
@@ -293,6 +295,7 @@ void PerforceDock::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("get_latest_requested"));
 	ADD_SIGNAL(MethodInfo("resolve_requested"));
 	ADD_SIGNAL(MethodInfo("remove_cache_requested"));
+	ADD_SIGNAL(MethodInfo("revert_unchanged_requested"));
 	ADD_SIGNAL(MethodInfo("enable_p4ignore_requested"));
 	ADD_SIGNAL(MethodInfo("revert_requested", PropertyInfo(Variant::PACKED_STRING_ARRAY, "paths")));
 	ADD_SIGNAL(MethodInfo("submit_requested", PropertyInfo(Variant::STRING, "description")));
@@ -407,6 +410,12 @@ PerforceDock::PerforceDock() {
 	revert_button->set_tooltip_text(TTR("Discard your changes to the selected files."));
 	revert_button->connect(SceneStringName(pressed), callable_mp(this, &PerforceDock::_revert_pressed));
 	submit_hb->add_child(revert_button);
+
+	revert_unchanged_button = memnew(Button);
+	revert_unchanged_button->set_text(TTR("Revert Unchanged"));
+	revert_unchanged_button->set_tooltip_text(TTR("Revert checked out files you haven't actually changed (p4 revert -a). Your changes are never touched."));
+	revert_unchanged_button->connect(SceneStringName(pressed), callable_mp(this, &PerforceDock::_emit).bind(SNAME("revert_unchanged_requested")));
+	submit_hb->add_child(revert_unchanged_button);
 
 	description_edit = memnew(LineEdit);
 	description_edit->set_h_size_flags(SIZE_EXPAND_FILL);

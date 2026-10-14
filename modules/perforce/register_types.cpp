@@ -44,12 +44,17 @@
 
 void initialize_perforce_module(ModuleInitializationLevel p_level) {
 	if (p_level == MODULE_INITIALIZATION_LEVEL_CORE) {
-		// `godot --headless --merge-scene <base> <theirs> <yours> <result>` runs the
+		// `godot --headless --merge-scene -- <base> <theirs> <yours> <result>` runs the
 		// scene merge tool (for P4V / `p4 resolve`) and exits before anything else starts.
 		List<String> cmdline = OS::get_singleton()->get_cmdline_args();
 		if (cmdline.find("--merge-scene")) {
+			// Paths may come after "--" (user arguments): Godot's own argument parsing
+			// would otherwise take a path ending in "project.godot" as the project to open.
 			Vector<String> args;
 			for (const String &arg : cmdline) {
+				args.push_back(arg);
+			}
+			for (const String &arg : OS::get_singleton()->get_cmdline_user_args()) {
 				args.push_back(arg);
 			}
 			int exit_code = SceneMerger::run_command_line(args);

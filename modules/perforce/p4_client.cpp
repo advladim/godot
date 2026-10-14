@@ -196,22 +196,39 @@ P4Result P4Client::login(const String &p_password) {
 	stdio->flush();
 
 	// Read until the process exits and closes its end of the pipe.
-	PackedByteArray bytes;
-	uint8_t byte = 0;
-	while (stdio->get_buffer(&byte, 1) == 1 && stdio->get_error() == OK) {
-		bytes.push_back(byte);
-	}
+	auto read_all = [](const Ref<FileAccess> &p_pipe) {
+		PackedByteArray bytes;
+		uint8_t byte = 0;
+		while (p_pipe.is_valid() && p_pipe->get_buffer(&byte, 1) == 1 && p_pipe->get_error() == OK) {
+			bytes.push_back(byte);
+		}
+		return String::utf8((const char *)bytes.ptr(), bytes.size());
+	};
+	String output = read_all(stdio);
 	stdio->close();
+	// Connection problems are reported on stderr, outside of the -s formatting.
+	Ref<FileAccess> err_pipe = pipes.get("stderr", Ref<FileAccess>());
+	const String errors = read_all(err_pipe);
+	if (err_pipe.is_valid()) {
+		err_pipe->close();
+	}
 
 	int64_t pid = pipes.get("pid", -1);
 	while (pid != -1 && OS::get_singleton()->is_process_running(pid)) {
 		OS::get_singleton()->delay_usec(10000);
 	}
 
-	String output = String::utf8((const char *)bytes.ptr(), bytes.size());
 	// The password prompt has no prefix; don't treat it as an error.
 	output = output.replace("Enter password:", "");
 	_parse(output, result);
+	for (const String &line : errors.replace("\r", "").split("\n", false)) {
+		if (!line.strip_edges().is_empty()) {
+			result.errors.push_back(line.strip_edges());
+		}
+	}
+	if (!result.ok() && result.errors.is_empty() && result.warnings.is_empty()) {
+		result.errors.push_back("p4 login gave no details. Check the server address and that P4V can connect.");
+	}
 	return result;
 }
 

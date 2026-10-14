@@ -40,6 +40,7 @@ class CheckBox;
 class ConfirmationDialog;
 class PerforceContextMenu;
 class Label;
+class PopupMenu;
 class LineEdit;
 class PerforceDock;
 class PerforceResolveDialog;
@@ -67,6 +68,7 @@ class PerforcePlugin : public EditorPlugin {
 	LineEdit *port_edit = nullptr;
 	LineEdit *user_edit = nullptr;
 	LineEdit *client_edit = nullptr;
+	PopupMenu *workspace_menu = nullptr;
 	LineEdit *password_edit = nullptr;
 	CheckBox *auto_checkout_check = nullptr;
 
@@ -145,6 +147,12 @@ class PerforcePlugin : public EditorPlugin {
 	void _confirmed();
 
 	void _show_connection_dialog(const String &p_message = String());
+	void _choose_workspace();
+	void _workspace_chosen(int p_index);
+
+	void _revert_unchanged();
+	void _task_revert_unchanged();
+	void _revert_unchanged_done(const Dictionary &p_result);
 	void _connection_dialog_confirmed();
 	void _login_required(const String &p_message);
 	void _activity(const String &p_message, int p_level);

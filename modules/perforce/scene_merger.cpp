@@ -98,7 +98,9 @@ String node_path(const Section &p_node) {
 
 void assign_key(Section &r_section) {
 	const String &tag = r_section.tag;
-	if (tag == "gd_scene" || tag == "gd_resource") {
+	if (tag.is_empty()) {
+		r_section.key = "#preamble"; // Settings before the first [section] (project.godot).
+	} else if (tag == "gd_scene" || tag == "gd_resource") {
 		r_section.key = "#header";
 	} else if (tag == "resource") {
 		r_section.key = "#resource";
@@ -123,7 +125,9 @@ void assign_key(Section &r_section) {
 
 String describe(const Section &p_section) {
 	const String &tag = p_section.tag;
-	if (tag == "gd_scene" || tag == "gd_resource") {
+	if (tag.is_empty()) {
+		return "Top of file";
+	} else if (tag == "gd_scene" || tag == "gd_resource") {
 		return "File header";
 	} else if (tag == "resource") {
 		return "Resource";
@@ -210,7 +214,28 @@ class Parser {
 		return text.substr(start, pos - start);
 	}
 
+	// key = value lines up to the next section header.
+	Error parse_props(Section &r_section, String &r_error) {
+		while (true) {
+			skip_whitespace();
+			if (eof() || peek() == '[') {
+				return OK;
+			}
+			String key = scan_key();
+			skip_spaces();
+			if (peek() != '=') {
+				r_error = vformat("Expected '=' after \"%s\" in [%s].", key, r_section.tag);
+				return ERR_PARSE_ERROR;
+			}
+			pos++;
+			skip_spaces();
+			r_section.props.push_back({ key, scan_value(false) });
+		}
+	}
+
 public:
+	String leading_comment; // ';' lines at the top (project.godot), kept as is.
+
 	Error parse(Vector<Section> &r_sections, String &r_error) {
 		while (true) {
 			skip_whitespace();
@@ -218,14 +243,28 @@ public:
 				return OK;
 			}
 			if (peek() == ';') { // Comment line.
+				const int start = pos;
 				while (!eof() && peek() != '\n') {
 					pos++;
+				}
+				if (r_sections.is_empty()) {
+					leading_comment += text.substr(start, pos - start).strip_edges(false, true) + "\n";
 				}
 				continue;
 			}
 			if (peek() != '[') {
-				r_error = vformat("Expected a section header at character %d.", pos);
-				return ERR_PARSE_ERROR;
+				if (!r_sections.is_empty()) {
+					r_error = vformat("Expected a section header at character %d.", pos);
+					return ERR_PARSE_ERROR;
+				}
+				// Config files (project.godot) start with settings outside any section.
+				Section preamble;
+				if (parse_props(preamble, r_error) != OK) {
+					return ERR_PARSE_ERROR;
+				}
+				assign_key(preamble);
+				r_sections.push_back(preamble);
+				continue;
 			}
 			pos++;
 
@@ -252,20 +291,8 @@ public:
 				section.attrs.push_back({ key, scan_value(true) });
 			}
 
-			while (true) {
-				skip_whitespace();
-				if (eof() || peek() == '[') {
-					break;
-				}
-				String key = scan_key();
-				skip_spaces();
-				if (peek() != '=') {
-					r_error = vformat("Expected '=' after \"%s\" in [%s].", key, section.tag);
-					return ERR_PARSE_ERROR;
-				}
-				pos++;
-				skip_spaces();
-				section.props.push_back({ key, scan_value(false) });
+			if (parse_props(section, r_error) != OK) {
+				return ERR_PARSE_ERROR;
 			}
 
 			assign_key(section);
@@ -296,6 +323,32 @@ String serialize(const Vector<Section> &p_sections) {
 		}
 	}
 	return out;
+}
+
+// project.godot / export_presets.cfg style: "key=value", a blank line after each header.
+String serialize_config(const String &p_leading_comment, const Vector<Section> &p_sections) {
+	String out = p_leading_comment;
+	for (const Section &section : p_sections) {
+		if (!out.is_empty()) {
+			out += "\n";
+		}
+		if (!section.tag.is_empty()) {
+			out += "[" + section.tag + "]\n\n";
+		}
+		for (const Entry &prop : section.props) {
+			out += prop.key + "=" + prop.value + "\n";
+		}
+	}
+	return out;
+}
+
+// Config files (project.godot) have no [gd_scene]/[gd_resource] header.
+bool is_config(const Vector<Section> &p_sections) {
+	if (p_sections.is_empty()) {
+		return false;
+	}
+	const String &tag = p_sections[0].tag;
+	return tag != "gd_scene" && tag != "gd_resource";
 }
 
 // Union of two key sequences: p_ours order, with keys only in p_theirs inserted
@@ -358,6 +411,7 @@ class Merger {
 	SceneMerger::Choice default_choice;
 
 	Vector<Section> base, ours, theirs;
+	String leading_comment;
 
 	static int find_key(const Vector<Section> &p_sections, const String &p_key) {
 		for (int i = 0; i < p_sections.size(); i++) {
@@ -687,9 +741,13 @@ public:
 		};
 		for (const Input &input : { Input{ p_base, base, "base" }, Input{ p_ours, ours, "yours" }, Input{ p_theirs, theirs, "theirs" } }) {
 			String error;
-			if (Parser(input.text).parse(input.sections, error) != OK) {
+			Parser parser(input.text);
+			if (parser.parse(input.sections, error) != OK) {
 				r_error = vformat("Could not parse the %s version: %s", input.name, error);
 				return ERR_PARSE_ERROR;
+			}
+			if (&input.sections == &ours || leading_comment.is_empty()) {
+				leading_comment = parser.leading_comment; // Ours wins.
 			}
 		}
 		return OK;
@@ -739,6 +797,9 @@ public:
 			}
 		}
 
+		if (is_config(ours.is_empty() ? theirs : ours)) {
+			return serialize_config(leading_comment, merged); // Order as written; no nodes or resources.
+		}
 		update_moved_node_paths(merged);
 		return serialize(fix_order(merged));
 	}
@@ -752,7 +813,12 @@ public:
 SceneMerger::Result SceneMerger::merge(const String &p_base, const String &p_ours, const String &p_theirs, const HashMap<String, Choice> &p_choices, Choice p_default) {
 	Result result;
 	Merger merger(p_choices, p_default);
-	if (merger.parse(p_base, p_ours, p_theirs, result.error) != OK) {
+	// Perforce converts line endings on sync (CRLF on Windows workspaces) and
+	// back on submit; merge with Godot's own LF so multi-line values stay intact.
+	const String base = p_base.replace("\r\n", "\n");
+	const String ours = p_ours.replace("\r\n", "\n");
+	const String theirs = p_theirs.replace("\r\n", "\n");
+	if (merger.parse(base, ours, theirs, result.error) != OK) {
 		return result;
 	}
 	result.text = merger.merge();
@@ -763,7 +829,7 @@ SceneMerger::Result SceneMerger::merge(const String &p_base, const String &p_our
 int SceneMerger::run_command_line(const Vector<String> &p_args) {
 	int index = p_args.find("--merge-scene");
 	if (index == -1 || index + 4 >= p_args.size()) {
-		print_error("Usage: godot --headless --merge-scene <base> <theirs> <yours> <result>");
+		print_error("Usage: godot --headless --merge-scene -- <base> <theirs> <yours> <result>");
 		return 2;
 	}
 	const String base_path = p_args[index + 1], theirs_path = p_args[index + 2], ours_path = p_args[index + 3], result_path = p_args[index + 4];

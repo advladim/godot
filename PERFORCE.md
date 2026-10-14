@@ -160,7 +160,7 @@ sides is a conflict.
 
 - Extension: `.tscn` (repeat for `.tres`)
 - Application: path to this `godot.windows.editor.x86_64.exe`
-- Arguments: `--headless --merge-scene %b %1 %2 %r`
+- Arguments: `--headless --merge-scene -- %b %1 %2 %r`
 
 ### Use it from `p4 resolve`
 
@@ -168,7 +168,7 @@ Create `godot-merge.bat` next to the editor:
 
 ```bat
 @echo off
-"%~dp0godot.windows.editor.x86_64.exe" --headless --merge-scene %1 %2 %3 %4
+"%~dp0godot.windows.editor.x86_64.exe" --headless --merge-scene -- %1 %2 %3 %4
 ```
 
 and `p4 set P4MERGE=C:\path\to\godot-merge.bat`. Then choose `m` (merge) in

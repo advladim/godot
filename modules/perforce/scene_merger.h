@@ -34,7 +34,8 @@
 #include "core/templates/hash_map.h"
 #include "core/templates/vector.h"
 
-// Structure-aware three-way merge for Godot text resources (.tscn / .tres).
+// Structure-aware three-way merge for Godot text resources (.tscn / .tres) and
+// config files (project.godot, export_presets.cfg).
 //
 // The file is treated as sections ([ext_resource], [sub_resource], [node],
 // [connection], ...) that are matched by identity (resource path/uid,
@@ -68,7 +69,7 @@ public:
 	// Conflicts not listed in p_choices are resolved with p_default.
 	static Result merge(const String &p_base, const String &p_ours, const String &p_theirs, const HashMap<String, Choice> &p_choices = HashMap<String, Choice>(), Choice p_default = CHOICE_OURS);
 
-	// Entry point for `godot --merge-scene <base> <theirs> <yours> <result>`
+	// Entry point for `godot --merge-scene -- <base> <theirs> <yours> <result>`
 	// (the argument order Perforce uses for merge tools). Returns the process exit code:
 	// 0 = merged cleanly, 1 = merged with conflicts (local side kept), 2 = error.
 	static int run_command_line(const Vector<String> &p_args);

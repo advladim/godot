@@ -231,4 +231,75 @@ TEST_CASE("[SceneMerger] Garbage input reports an error") {
 	CHECK(result.text.is_empty());
 }
 
+// project.godot as Godot 4.7 writes it.
+static const char *BASE_PROJECT = R"(; Engine configuration file.
+; It's best edited using the editor UI and not directly,
+; since the parameters that go here are not all obvious.
+;
+; Format:
+;   [section] ; section goes between []
+;   param=value ; assign values to parameters
+
+config_version=5
+
+[application]
+
+config/name="Game"
+config/features=PackedStringArray("4.7", "Forward Plus")
+
+[input]
+
+move_left={
+"deadzone": 0.2,
+"events": [Object(InputEventKey,"resource_local_to_scene":false,"resource_name":"","device":-1,"window_id":0,"alt_pressed":false,"shift_pressed":false,"ctrl_pressed":false,"meta_pressed":false,"pressed":false,"keycode":0,"physical_keycode":65,"key_label":0,"unicode":97,"location":0,"echo":false,"script":null)
+]
+}
+)";
+
+static String add_action(const String &p_project, const String &p_name, int p_key) {
+	return p_project + vformat("%s={\n\"deadzone\": 0.2,\n\"events\": [Object(InputEventKey,\"physical_keycode\":%d,\"script\":null)\n]\n}\n", p_name, p_key);
+}
+
+TEST_CASE("[SceneMerger] project.godot round-trips exactly") {
+	SceneMerger::Result result = SceneMerger::merge(BASE_PROJECT, BASE_PROJECT, BASE_PROJECT);
+	CHECK(result.error.is_empty());
+	CHECK(result.conflicts.is_empty());
+	CHECK(result.text == String(BASE_PROJECT));
+}
+
+TEST_CASE("[SceneMerger] Input actions added by two people are both kept") {
+	const String ours = add_action(BASE_PROJECT, "jump", 32);
+	const String theirs = add_action(BASE_PROJECT, "crouch", 67);
+
+	SceneMerger::Result result = SceneMerger::merge(BASE_PROJECT, ours, theirs);
+	CHECK(result.error.is_empty());
+	CHECK(result.conflicts.is_empty());
+	CHECK(result.text.contains("\njump={"));
+	CHECK(result.text.contains("\ncrouch={"));
+	CHECK(result.text.contains("\nmove_left={"));
+	CHECK(result.text.begins_with("; Engine configuration file."));
+	CHECK(result.text.contains("\nconfig_version=5\n"));
+}
+
+TEST_CASE("[SceneMerger] New sections and settings from both sides are kept") {
+	const String ours = String(BASE_PROJECT) + "\n[autoload]\n\nGame=\"*res://game.gd\"\n";
+	const String theirs = String(BASE_PROJECT).replace("config/name=\"Game\"", "config/name=\"Game\"\nrun/main_scene=\"res://main.tscn\"");
+
+	SceneMerger::Result result = SceneMerger::merge(BASE_PROJECT, ours, theirs);
+	CHECK(result.conflicts.is_empty());
+	CHECK(result.text.contains("[autoload]\n\nGame=\"*res://game.gd\"\n"));
+	CHECK(result.text.contains("config/name=\"Game\"\nrun/main_scene=\"res://main.tscn\"\n"));
+}
+
+TEST_CASE("[SceneMerger] The same setting changed differently in project.godot is a conflict") {
+	const String ours = String(BASE_PROJECT).replace("config/name=\"Game\"", "config/name=\"Ours\"");
+	const String theirs = String(BASE_PROJECT).replace("config/name=\"Game\"", "config/name=\"Theirs\"");
+
+	SceneMerger::Result result = SceneMerger::merge(BASE_PROJECT, ours, theirs);
+	REQUIRE(result.conflicts.size() == 1);
+	CHECK(result.conflicts[0].section == "[application]");
+	CHECK(result.conflicts[0].property == "config/name");
+	CHECK(result.text.contains("config/name=\"Ours\""));
+}
+
 } // namespace TestSceneMerger
