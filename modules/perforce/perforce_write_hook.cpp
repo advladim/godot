@@ -185,6 +185,10 @@ bool PerforceWriteHook::take_offline_dirty() {
 	return dirty;
 }
 
+void PerforceWriteHook::set_auto_delete(bool p_enabled) {
+	auto_delete.set_to(p_enabled);
+}
+
 void PerforceWriteHook::set_auto_checkout(bool p_enabled) {
 	auto_checkout.set_to(p_enabled);
 }
@@ -298,10 +302,26 @@ bool PerforceWriteHook::checkout(const Vector<String> &p_abs_paths) {
 
 bool PerforceWriteHook::has_pending() {
 	MutexLock lock(pending_mutex);
-	return !pending_adds.is_empty() || !pending_edits.is_empty();
+	return !pending_adds.is_empty() || !pending_edits.is_empty() || !local_deletes.is_empty();
 }
 
 void PerforceWriteHook::flush_pending() {
+	Vector<String> deleted;
+	{
+		MutexLock lock(pending_mutex);
+		for (const String &name : local_deletes) {
+			// Skip files that were written again right away (tools that save by delete + write).
+			if (!FileAccess::exists(project_root_original.path_join(name))) {
+				deleted.push_back(name);
+			}
+		}
+		local_deletes.clear();
+	}
+	if (deleted.size() == 1) {
+		_log(vformat("Deleted %s on disk only; Perforce still has it. To restore it or delete it in Perforce too, use Review in the Perforce panel.", deleted[0]), PerforceDock::LOG_WARNING);
+	} else if (!deleted.is_empty()) {
+		_log(vformat("Deleted %s on disk only; Perforce still has them. To restore them or delete them in Perforce too, use Review in the Perforce panel.", _join_names(deleted, "%d files")), PerforceDock::LOG_WARNING);
+	}
 	_flush_adds();
 	_flush_edits();
 }
@@ -421,14 +441,52 @@ void PerforceWriteHook::_flush_adds() {
 
 	// Tagged output: one record per file opened for add.
 	Vector<String> added;
+	HashSet<String> added_keys;
 	for (const P4Result::Record &rec : result.records) {
 		if (P4Result::field(rec, "action") == "add") {
-			added.push_back(_normalize(P4Result::field(rec, "clientFile")).get_file());
+			const String local = _normalize(P4Result::field(rec, "clientFile"));
+			added.push_back(local.get_file());
+			added_keys.insert(_key(local));
 		}
 	}
 	if (!added.is_empty()) {
 		_log("Marked as new: " + _join_names(added, "%d files"), PerforceDock::LOG_INFO);
 	}
+
+	// Files that weren't added may already be in the depot: written again after a
+	// local-only delete ("can't add existing file"), or after a `p4 delete` by a
+	// tool that saves by delete + write. Open those for edit so the change isn't lost.
+	Vector<String> recheck;
+	for (const String &path : to_add) {
+		if (!added_keys.has(_key(path)) && FileAccess::exists(path)) {
+			recheck.push_back(P4Client::escape(path));
+		}
+	}
+	if (!recheck.is_empty()) {
+		P4Result stats = P4Client::run_files({ "fstat" }, recheck);
+		Vector<String> to_edit, to_undelete;
+		for (const P4Result::Record &rec : stats.records) {
+			const String local = P4Client::escape(_normalize(P4Result::field(rec, "clientFile")));
+			const String action = P4Result::field(rec, "action");
+			if (action == "delete") {
+				to_undelete.push_back(local);
+			} else if (action.is_empty() && rec.has("headRev") && !_is_deleted_action(P4Result::field(rec, "headAction"))) {
+				to_edit.push_back(local);
+			}
+		}
+		if (!to_undelete.is_empty()) {
+			P4Client::run_files({ "revert", "-k" }, to_undelete); // -k: keep the new local file.
+			to_edit.append_array(to_undelete);
+		}
+		if (!to_edit.is_empty()) {
+			P4Result edit = P4Client::run_files({ "edit" }, to_edit);
+			_report("Checking out files", edit);
+			if (!edit.records.is_empty()) {
+				_log(vformat("Checked out %d file(s) that were deleted and written again.", edit.records.size()), PerforceDock::LOG_INFO);
+			}
+		}
+	}
+
 	MutexLock lock(pending_mutex);
 	for (const String &path : to_add) {
 		known_opened.insert(_key(path));
@@ -465,6 +523,10 @@ Error PerforceWriteHook::before_write(const String &p_path) {
 		if (_is_metadata(path)) {
 			// Never let .import/.uid writes fail; check them out in the background.
 			P4Client::make_writable(path);
+			{
+				MutexLock lock(pending_mutex);
+				made_writable.insert(_key(path));
+			}
 			if (automatic) {
 				_queue_edit(path);
 			}
@@ -476,7 +538,14 @@ Error PerforceWriteHook::before_write(const String &p_path) {
 		}
 		// Refuse up front if checkout fails (locked by someone else), instead of
 		// failing later with a confusing "safe save failed" and a stray temp file.
-		return checkout({ path }) ? OK : ERR_FILE_NO_PERMISSION;
+		if (!checkout({ path })) {
+			return ERR_FILE_NO_PERMISSION;
+		}
+		if (!offline.is_set()) {
+			MutexLock lock(pending_mutex);
+			just_checked_out.insert(_key(path));
+		}
+		return OK;
 	}
 
 	// Writable but maybe not checked out (P4V "allwrite" workspaces, files made
@@ -525,6 +594,13 @@ Error PerforceWriteHook::before_remove(const String &p_path) {
 		_log("Removed new file " + _display(path), PerforceDock::LOG_INFO);
 		return ERR_SKIP;
 	}
+	if (action == "move/add" && !auto_delete.is_set()) {
+		// Deleting a file that was moved: undo the move instead, so the original
+		// comes back where it was and nothing is marked for delete.
+		_report("Reverting " + _display(path), P4Client::run({ "revert", esc }));
+		_log(vformat("Undid the move of %s: the file is back at its original location (automatic delete is off).", _display(path)), PerforceDock::LOG_WARNING);
+		return FileAccess::exists(path) ? ERR_SKIP : OK;
+	}
 	if (action == "move/add") {
 		// Deleting a moved file deletes the original.
 		const String original = P4Result::field(stat, "movedFile");
@@ -536,6 +612,20 @@ Error PerforceWriteHook::before_remove(const String &p_path) {
 		return FileAccess::exists(path) ? ERR_SKIP : OK;
 	}
 	if (_is_deleted_action(action) || (action.is_empty() && _is_deleted_action(P4Result::field(stat, "headAction")))) {
+		return ERR_SKIP;
+	}
+	if (!auto_delete.is_set()) {
+		// Only delete the local file. It shows up as "missing on disk" in the panel,
+		// where it can be restored or deliberately marked for delete.
+		if (!action.is_empty()) {
+			_report("Reverting " + _display(path), P4Client::run({ "revert", "-k", esc })); // -k: keep the file for the delete below.
+		}
+		if (P4Client::is_read_only(path)) {
+			P4Client::make_writable(path);
+		}
+		MutexLock lock(pending_mutex);
+		local_deletes.push_back(_display(path));
+		known_opened.erase(_key(path));
 		return ERR_SKIP;
 	}
 	if (!action.is_empty()) {
@@ -670,6 +760,37 @@ Error PerforceWriteHook::before_rename(const String &p_from, const String &p_to)
 	return FAILED;
 }
 
+// A save produced the same bytes the file already had (Terrain3D data, .import/.uid
+// regeneration, re-saving an untouched scene...): undo the checkout we did just
+// for it, so only real changes end up in the changelist.
+void PerforceWriteHook::write_unchanged(const String &p_path) {
+	const String path = _normalize(p_path);
+	if (!_is_managed(path)) {
+		return;
+	}
+	const String key = _key(path);
+	bool revert = false;
+	bool relock = false;
+	{
+		MutexLock lock(pending_mutex);
+		pending_edits.erase(path);
+		revert = just_checked_out.erase(key);
+		relock = made_writable.erase(key) && !known_opened.has(key);
+	}
+	if (relock) {
+		P4Client::make_read_only(path);
+	}
+	if (revert && !offline.is_set()) {
+		// -a: only reverts if the file is identical to the depot revision, so real
+		// changes from an earlier save are never lost.
+		P4Result result = P4Client::run({ "revert", "-a", P4Client::escape(path) });
+		if (!result.records.is_empty()) {
+			MutexLock lock(pending_mutex);
+			known_opened.erase(key);
+		}
+	}
+}
+
 void PerforceWriteHook::prepare_writes(const Vector<String> &p_paths) {
 	if (suppressed) {
 		return;
@@ -699,6 +820,7 @@ PerforceWriteHook::PerforceWriteHook(const String &p_project_root, const Callabl
 	if (!project_root.ends_with("/")) {
 		project_root += "/";
 	}
+	project_root_original = project_root;
 #ifdef WINDOWS_ENABLED
 	project_root = project_root.to_lower();
 #endif

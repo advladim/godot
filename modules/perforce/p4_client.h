@@ -99,6 +99,7 @@ public:
 	// uses the read-only attribute; Linux/macOS use the owner write permission.
 	static bool is_read_only(const String &p_path);
 	static void make_writable(const String &p_path);
+	static void make_read_only(const String &p_path);
 
 	// Escapes the characters Perforce treats as wildcards/revision specifiers (@ # % *).
 	static String escape(const String &p_path);

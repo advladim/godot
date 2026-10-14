@@ -85,6 +85,13 @@ private:
 	Label *setup_label = nullptr;
 	Button *remove_cache_button = nullptr;
 	Button *p4ignore_button = nullptr;
+	Button *remove_tmp_button = nullptr;
+
+	HBoxContainer *health_bar = nullptr; // Files where the workspace and Perforce disagree.
+	TextureRect *health_icon = nullptr;
+	Label *health_label = nullptr;
+	Button *review_button = nullptr;
+	Button *health_refresh_button = nullptr;
 
 	Label *files_label = nullptr;
 	Tree *files_tree = nullptr;
@@ -116,7 +123,10 @@ public:
 	void set_opened_files(const Array &p_files);
 	void set_remote_state(int p_outdated, int p_unresolved);
 	// p_cache_files: number of .godot files in the depot. p_p4v_ignores: P4IGNORE is set, so P4V skips them too.
-	void set_setup_state(int p_cache_files, bool p_p4v_ignores);
+	// p_tmp_files: leftover temp files from failed saves in the depot.
+	void set_setup_state(int p_cache_files, bool p_p4v_ignores, int p_tmp_files);
+	// Counts from the last workspace check; p_checking while one runs.
+	void set_health(int p_changed, int p_new, int p_missing, bool p_checking);
 	void add_log(const String &p_message, LogLevel p_level);
 	void clear_description();
 

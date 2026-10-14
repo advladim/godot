@@ -33,6 +33,7 @@
 #include "perforce_context_menu.h"
 #include "perforce_dock.h"
 #include "perforce_resolve_dialog.h"
+#include "perforce_review_dialog.h"
 #include "perforce_write_hook.h"
 
 #include "core/config/project_settings.h"
@@ -230,13 +231,17 @@ void PerforcePlugin::_connect_done(const Dictionary &p_result) {
 
 	connected = status == PerforceDock::STATUS_CONNECTED;
 	const bool offline = status == PerforceDock::STATUS_OFFLINE;
-	if (offline) {
+	if (offline || status == PerforceDock::STATUS_LOGIN_REQUIRED) {
 		// The server is unreachable: keep working offline and retry in the background.
 		// Harmless if the project isn't in Perforce after all: the first successful
 		// connection says so, and the remembered changes are dropped.
+		// Logged out works the same way: nothing waits on the server, and the
+		// remembered changes are sent once logged in.
 		_install_hook();
 		hook->set_offline(true);
-		reconnect_timer->start();
+		if (offline) {
+			reconnect_timer->start();
+		}
 	} else if (workspace_name.is_empty()) {
 		_remove_hook();
 		DirAccess::remove_absolute(_offline_file()); // Not a Perforce project: nothing to send later.
@@ -247,6 +252,7 @@ void PerforcePlugin::_connect_done(const Dictionary &p_result) {
 			reconnect_timer->stop();
 			offline_reported = false;
 			EditorSettings::get_singleton()->set_project_metadata("perforce", "last_workspace", workspace_name);
+			health_checked = false;
 			_ensure_p4ignore();
 			if (hook->get_offline_work_count() > 0) {
 				_start_task(callable_mp(this, &PerforcePlugin::_task_send_offline_work).bind(hook->take_offline_work()), TTR("Sending offline changes to Perforce..."), true);
@@ -346,6 +352,7 @@ void PerforcePlugin::_task_refresh() {
 	// Project setup problems.
 	result["cache_files"] = P4Client::run({ "files", "-e", P4Client::escape(project_root) + "/.godot/..." }).records.size();
 	result["p4v_ignores"] = !P4Client::get_variable("P4IGNORE").is_empty();
+	result["tmp_files"] = P4Client::run({ "files", "-e", P4Client::escape(project_root) + "/....tmp" }).records.size();
 
 	callable_mp(this, &PerforcePlugin::_refresh_done).call_deferred(result);
 }
@@ -365,7 +372,10 @@ void PerforcePlugin::_refresh_done(const Dictionary &p_result) {
 	}
 	dock->set_opened_files(p_result["files"]);
 	dock->set_remote_state(p_result["outdated"], p_result["unresolved"]);
-	dock->set_setup_state(p_result["cache_files"], p_result["p4v_ignores"]);
+	dock->set_setup_state(p_result["cache_files"], p_result["p4v_ignores"], p_result["tmp_files"]);
+	if (!health_checked) {
+		_check_health(); // Once per connection; it reads every file, so not on every refresh.
+	}
 }
 
 // --- Get latest and resolving -------------------------------------------
@@ -721,6 +731,220 @@ void PerforcePlugin::_workspace_chosen(int p_index) {
 	client_edit->set_text(workspace_menu->get_item_metadata(workspace_menu->get_item_index(p_index)));
 }
 
+// --- Workspace health ------------------------------------------------------
+
+// Finds files where the workspace and Perforce disagree. Reads every file
+// (to compare digests), so it runs once per connection and on request.
+void PerforcePlugin::_check_health(bool p_open_review) {
+	if (!connected) {
+		return;
+	}
+	open_review_after_check = open_review_after_check || p_open_review;
+	if (health_pending) {
+		return; // The queued check will open the review if asked.
+	}
+	health_pending = true;
+	dock->set_health(0, 0, 0, true);
+	_start_task(callable_mp(this, &PerforcePlugin::_task_health), String(), true);
+}
+
+void PerforcePlugin::_task_health() {
+	const String spec = _depot_spec();
+	auto locals = [](const P4Result &p_result, bool p_skip_tmp) {
+		PackedStringArray paths;
+		for (const P4Result::Record &rec : p_result.records) {
+			const String path = P4Result::field(rec, "clientFile").replace_char('\\', '/');
+			if (!path.is_empty() && !(p_skip_tmp && path.ends_with(".tmp"))) {
+				paths.push_back(path);
+			}
+		}
+		paths.sort();
+		return paths;
+	};
+	Dictionary result;
+	P4Result changed = P4Client::run({ "diff", "-se", spec }); // Unopened files that differ from the depot.
+	P4Result added = P4Client::run({ "reconcile", "-n", "-a", spec }); // Files not in the depot (honors .p4ignore).
+	P4Result missing = P4Client::run({ "diff", "-sd", spec }); // Unopened files missing on disk.
+	result["changed"] = locals(changed, false);
+	result["new"] = locals(added, true);
+	result["missing"] = locals(missing, true); // .tmp junk has its own cleanup button.
+	result["connection_failed"] = changed.connection_failed || added.connection_failed || missing.connection_failed;
+	callable_mp(this, &PerforcePlugin::_health_done).call_deferred(result);
+}
+
+void PerforcePlugin::_health_done(const Dictionary &p_result) {
+	health_pending = false;
+	_finish_task();
+	if ((bool)p_result["connection_failed"]) {
+		_go_offline(String());
+		return;
+	}
+	health_changed = p_result["changed"];
+	health_new = p_result["new"];
+	health_missing = p_result["missing"];
+	health_checked = true;
+	dock->set_health(health_changed.size(), health_new.size(), health_missing.size(), false);
+	const String summary = vformat("%d/%d/%d", health_changed.size(), health_new.size(), health_missing.size());
+	if (summary != health_logged && (!health_changed.is_empty() || !health_new.is_empty() || !health_missing.is_empty())) {
+		health_logged = summary;
+		dock->add_log(vformat(TTR("Workspace check: %d changed but not checked out, %d new files not in Perforce, %d missing on disk. Click Review to sort them out."), health_changed.size(), health_new.size(), health_missing.size()), PerforceDock::LOG_WARNING);
+	}
+	if (open_review_after_check) {
+		open_review_after_check = false;
+		review_dialog->open(project_root, health_changed, health_new, health_missing);
+	}
+}
+
+void PerforcePlugin::_review() {
+	// Always look again first: files may have changed since the last check.
+	_check_health(true);
+}
+
+void PerforcePlugin::_review_apply(const String &p_action, const PackedStringArray &p_paths) {
+	if (p_action == "delete") {
+		_confirm(TTR("Mark for Delete"), vformat(TTRN("Mark %d file for delete in Perforce? When you submit, it's deleted for the whole team.", "Mark %d files for delete in Perforce? When you submit, they're deleted for the whole team.", p_paths.size()), p_paths.size()), TTR("Mark for Delete"), callable_mp(this, &PerforcePlugin::_task_review_apply).bind(p_action, p_paths));
+		return;
+	}
+	_start_task(callable_mp(this, &PerforcePlugin::_task_review_apply).bind(p_action, p_paths), TTR("Updating Perforce..."), true);
+}
+
+void PerforcePlugin::_task_review_apply(const String &p_action, const PackedStringArray &p_paths) {
+	Vector<String> files;
+	for (const String &path : p_paths) {
+		if (p_action == "add") {
+			files.push_back(path); // `add -f` takes unescaped names.
+		} else if (p_action == "restore") {
+			files.push_back(P4Client::escape(path) + "#have"); // Bring back the revision we had.
+		} else {
+			files.push_back(P4Client::escape(path));
+		}
+	}
+	P4Result result;
+	if (p_action == "checkout") {
+		result = P4Client::run_files({ "edit" }, files);
+	} else if (p_action == "add") {
+		result = P4Client::run_files({ "add", "-f" }, files);
+	} else if (p_action == "restore") {
+		result = P4Client::run_files({ "sync", "-f" }, files);
+	} else if (p_action == "delete") {
+		result = P4Client::run_files({ "delete" }, files);
+	}
+	Dictionary out;
+	out["action"] = p_action;
+	out["count"] = result.records.size();
+	out["requested"] = p_paths.size();
+	out["messages"] = result.errors.is_empty() ? String() : result.get_messages();
+	out["login_required"] = result.login_required;
+	callable_mp(this, &PerforcePlugin::_review_apply_done).call_deferred(out);
+}
+
+void PerforcePlugin::_review_apply_done(const Dictionary &p_result) {
+	_finish_task();
+	if ((bool)p_result["login_required"]) {
+		_login_required(String());
+		return;
+	}
+	const String action = p_result["action"];
+	const int count = p_result["count"];
+	String message;
+	if (action == "checkout") {
+		message = vformat(TTRN("Checked out %d changed file.", "Checked out %d changed files.", count), count);
+	} else if (action == "add") {
+		message = vformat(TTRN("Marked %d new file for add.", "Marked %d new files for add.", count), count);
+	} else if (action == "restore") {
+		message = vformat(TTRN("Restored %d missing file from Perforce.", "Restored %d missing files from Perforce.", count), count);
+		EditorFileSystem::get_singleton()->scan_changes();
+	} else {
+		message = vformat(TTRN("Marked %d missing file for delete. Submit to delete it for everyone, or revert to keep it.", "Marked %d missing files for delete. Submit to delete them for everyone, or revert to keep them.", count), count);
+	}
+	dock->add_log(message, PerforceDock::LOG_SUCCESS);
+	const String messages = p_result["messages"];
+	if (!messages.is_empty()) {
+		dock->add_log(messages, PerforceDock::LOG_WARNING);
+	}
+	_check_health();
+	_refresh();
+}
+
+// --- Leftover .tmp files ----------------------------------------------------
+
+void PerforcePlugin::_remove_tmp() {
+	_confirm(TTR("Remove Leftover .tmp Files"),
+			TTR("Godot leaves name1234.tmp files behind when a save is interrupted. They're junk.\n\nThis submits a change that deletes the ones in Perforce, and deletes leftover ones on your disk (only files named like an existing file plus digits and .tmp). .p4ignore already keeps new ones out."),
+			TTR("Remove and Submit"), callable_mp(this, &PerforcePlugin::_task_remove_tmp));
+}
+
+void PerforcePlugin::_task_remove_tmp() {
+	Dictionary result;
+	const String spec = P4Client::escape(project_root) + "/....tmp";
+	P4Result del = P4Client::run({ "delete", spec });
+	String change;
+	if (!del.records.is_empty()) {
+		P4Result submit = P4Client::run({ "submit", "-d", "Remove leftover .tmp files from interrupted Godot saves.", spec });
+		for (const P4Result::Record &rec : submit.records) {
+			if (rec.has("submittedChange")) {
+				change = P4Result::field(rec, "submittedChange");
+			}
+		}
+		result["messages"] = submit.errors.is_empty() ? String() : submit.get_messages();
+	}
+	result["count"] = del.records.size();
+	result["change"] = change;
+	result["login_required"] = del.login_required;
+	callable_mp(this, &PerforcePlugin::_remove_tmp_done).call_deferred(result);
+}
+
+// Deletes Godot's safe-save leftovers: "<existing file><digits>.tmp".
+int PerforcePlugin::_remove_local_tmp_leftovers(const String &p_dir) {
+	Ref<DirAccess> da = DirAccess::open(p_dir);
+	if (da.is_null()) {
+		return 0;
+	}
+	int removed = 0;
+	for (const String &file : da->get_files()) {
+		if (!file.ends_with(".tmp")) {
+			continue;
+		}
+		String original = file.trim_suffix(".tmp");
+		while (!original.is_empty() && is_digit(original[original.length() - 1])) {
+			original = original.left(-1);
+		}
+		if (original.length() < file.length() - 4 && FileAccess::exists(p_dir.path_join(original))) {
+			const String path = p_dir.path_join(file);
+			if (P4Client::is_read_only(path)) {
+				P4Client::make_writable(path);
+			}
+			if (DirAccess::remove_absolute(path) == OK) {
+				removed++;
+			}
+		}
+	}
+	for (const String &dir : da->get_directories()) {
+		if (dir != ".godot") {
+			removed += _remove_local_tmp_leftovers(p_dir.path_join(dir));
+		}
+	}
+	return removed;
+}
+
+void PerforcePlugin::_remove_tmp_done(const Dictionary &p_result) {
+	_finish_task();
+	if ((bool)p_result["login_required"]) {
+		_login_required(String());
+		return;
+	}
+	const int local = _remove_local_tmp_leftovers(project_root);
+	const String change = p_result["change"];
+	const int count = p_result["count"];
+	if (count > 0 && change.is_empty()) {
+		dock->add_log(TTR("Removing .tmp files from Perforce failed:") + " " + String(p_result.get("messages", String())), PerforceDock::LOG_ERROR);
+	} else {
+		dock->add_log(vformat(TTR("Removed %d leftover .tmp files from Perforce%s and %d from disk."), count, change.is_empty() ? String() : vformat(" (change %s)", change), local), PerforceDock::LOG_SUCCESS);
+	}
+	EditorFileSystem::get_singleton()->scan_changes();
+	_refresh();
+}
+
 // --- Keeping the .godot cache out of Perforce ------------------------------
 
 // Every Perforce project needs a .p4ignore listing .godot/; create or fix it.
@@ -728,13 +952,16 @@ void PerforcePlugin::_workspace_chosen(int p_index) {
 void PerforcePlugin::_ensure_p4ignore() {
 	const String path = project_root.path_join(".p4ignore");
 	String text;
+	bool has_cache = false, has_tmp = false;
 	if (FileAccess::exists(path)) {
 		text = FileAccess::get_file_as_string(path);
 		for (const String &line : text.replace("\r", "").split("\n")) {
 			const String entry = line.strip_edges();
-			if (entry == ".godot" || entry == ".godot/" || entry == "/.godot/" || entry == ".godot/*" || entry == ".godot/**") {
-				return; // Already ignored.
-			}
+			has_cache = has_cache || entry == ".godot" || entry == ".godot/" || entry == "/.godot/" || entry == ".godot/*" || entry == ".godot/**";
+			has_tmp = has_tmp || entry == "*.tmp";
+		}
+		if (has_cache && has_tmp) {
+			return; // Already complete.
 		}
 		if (!text.is_empty() && !text.ends_with("\n")) {
 			text += "\n";
@@ -742,7 +969,12 @@ void PerforcePlugin::_ensure_p4ignore() {
 	} else {
 		text = "# Files Perforce should never add. Godot's .godot folder is a local cache.\n";
 	}
-	text += ".godot/\n";
+	if (!has_cache) {
+		text += ".godot/\n";
+	}
+	if (!has_tmp) {
+		text += "# Leftovers from interrupted saves (name1234.tmp).\n*.tmp\n";
+	}
 
 	Ref<FileAccess> file = FileAccess::open(path, FileAccess::WRITE);
 	if (file.is_null()) {
@@ -751,7 +983,7 @@ void PerforcePlugin::_ensure_p4ignore() {
 	}
 	file->store_string(text);
 	file.unref();
-	dock->add_log(TTR("Added .godot/ to .p4ignore so Perforce never adds the editor cache. Submit .p4ignore so your team gets it."), PerforceDock::LOG_SUCCESS);
+	dock->add_log(TTR("Updated .p4ignore so Perforce never adds the .godot cache or leftover .tmp files. Submit .p4ignore so your team gets it."), PerforceDock::LOG_SUCCESS);
 }
 
 void PerforcePlugin::_remove_cache() {
@@ -892,7 +1124,6 @@ void PerforcePlugin::_remove_hook() {
 
 void PerforcePlugin::_activity(const String &p_message, int p_level) {
 	dock->add_log(p_message, (PerforceDock::LogLevel)p_level);
-	print_line("Perforce: " + p_message);
 	if (p_level == PerforceDock::LOG_ERROR) {
 		EditorToaster::get_singleton()->popup_str("Perforce: " + p_message, EditorToaster::SEVERITY_WARNING);
 	}
@@ -940,9 +1171,15 @@ bool PerforcePlugin::_is_auto_checkout() const {
 	return EditorSettings::get_singleton()->get_project_metadata("perforce", "auto_checkout", true);
 }
 
+bool PerforcePlugin::_is_auto_delete() const {
+	// Off by default: deleting in Godot never marks files for delete on its own.
+	return EditorSettings::get_singleton()->get_project_metadata("perforce", "auto_delete", false);
+}
+
 void PerforcePlugin::_apply_auto_checkout() {
 	if (hook) {
 		hook->set_auto_checkout(_is_auto_checkout());
+		hook->set_auto_delete(_is_auto_delete());
 	}
 }
 
@@ -1044,8 +1281,11 @@ void PerforcePlugin::_task_send_offline_work(const Dictionary &p_work) {
 		} else if (!move.records.is_empty()) {
 			moved += move.records.size();
 		} else {
-			// Not versioned (or couldn't move): treat as a delete + add.
-			files.push_back(from);
+			// Not versioned (or couldn't move): the new location is new; the old one is
+			// only deleted in Perforce when automatic delete is on.
+			if (hook && hook->is_auto_delete()) {
+				files.push_back(from);
+			}
 			files.push_back(to);
 		}
 	}
@@ -1056,7 +1296,10 @@ void PerforcePlugin::_task_send_offline_work(const Dictionary &p_work) {
 	}
 	int edited = 0, added = 0, deleted = 0;
 	if (!went_offline && !specs.is_empty()) {
-		P4Result reconcile = P4Client::run_files({ "reconcile", "-e", "-a", "-d" }, specs);
+		// -d (mark missing files for delete) only with automatic delete on; otherwise
+		// they show up as "missing on disk" for the user to decide.
+		const bool deletes = hook && hook->is_auto_delete();
+		P4Result reconcile = deletes ? P4Client::run_files({ "reconcile", "-e", "-a", "-d" }, specs) : P4Client::run_files({ "reconcile", "-e", "-a" }, specs);
 		if (reconcile.connection_failed) {
 			went_offline = true;
 		}
@@ -1262,6 +1505,7 @@ void PerforcePlugin::_show_connection_dialog(const String &p_message) {
 	client_edit->set_placeholder(client_hint.is_empty() ? TTR("Detected automatically, or click Choose...") : client_hint);
 	password_edit->clear();
 	auto_checkout_check->set_pressed(_is_auto_checkout());
+	auto_delete_check->set_pressed(_is_auto_delete());
 
 	connection_message->set_text(p_message);
 	connection_message->set_visible(!p_message.is_empty());
@@ -1282,6 +1526,10 @@ void PerforcePlugin::_connection_dialog_confirmed() {
 	if (auto_checkout_check->is_pressed() != _is_auto_checkout()) {
 		EditorSettings::get_singleton()->set_project_metadata("perforce", "auto_checkout", auto_checkout_check->is_pressed());
 		dock->add_log(auto_checkout_check->is_pressed() ? TTR("Automatic checkout is on: saving checks files out and marks new files for add.") : TTR("Automatic checkout is off: check files out with right-click > Perforce: Check Out before editing them."), PerforceDock::LOG_INFO);
+	}
+	if (auto_delete_check->is_pressed() != _is_auto_delete()) {
+		EditorSettings::get_singleton()->set_project_metadata("perforce", "auto_delete", auto_delete_check->is_pressed());
+		dock->add_log(auto_delete_check->is_pressed() ? TTR("Automatic delete is on: deleting a file in Godot marks it for delete in Perforce.") : TTR("Automatic delete is off: deleting a file in Godot only deletes it on disk; review it under \"Missing on disk\" in the Perforce panel."), PerforceDock::LOG_INFO);
 	}
 	_apply_auto_checkout();
 	_apply_connection_settings();
@@ -1325,6 +1573,7 @@ void PerforcePlugin::_notification(int p_what) {
 			EditorInterface::get_singleton()->get_base_control()->add_child(connection_dialog);
 			EditorInterface::get_singleton()->get_base_control()->add_child(confirm_dialog);
 			EditorInterface::get_singleton()->get_base_control()->add_child(resolve_dialog);
+			EditorInterface::get_singleton()->get_base_control()->add_child(review_dialog);
 			add_child(flush_timer);
 			add_child(refresh_timer);
 			add_child(poll_timer);
@@ -1372,6 +1621,9 @@ PerforcePlugin::PerforcePlugin() {
 	dock->connect("revert_requested", callable_mp(this, &PerforcePlugin::_revert));
 	dock->connect("submit_requested", callable_mp(this, &PerforcePlugin::_submit));
 	dock->connect("remove_cache_requested", callable_mp(this, &PerforcePlugin::_remove_cache));
+	dock->connect("remove_tmp_requested", callable_mp(this, &PerforcePlugin::_remove_tmp));
+	dock->connect("review_requested", callable_mp(this, &PerforcePlugin::_review));
+	dock->connect("health_check_requested", callable_mp(this, &PerforcePlugin::_check_health).bind(false));
 	dock->connect("revert_unchanged_requested", callable_mp(this, &PerforcePlugin::_revert_unchanged));
 	dock->connect("enable_p4ignore_requested", callable_mp(this, &PerforcePlugin::_enable_p4ignore));
 
@@ -1394,6 +1646,9 @@ PerforcePlugin::PerforcePlugin() {
 
 	confirm_dialog = memnew(ConfirmationDialog);
 	confirm_dialog->connect(SceneStringName(confirmed), callable_mp(this, &PerforcePlugin::_confirmed));
+
+	review_dialog = memnew(PerforceReviewDialog);
+	review_dialog->connect("apply_requested", callable_mp(this, &PerforcePlugin::_review_apply));
 
 	resolve_dialog = memnew(PerforceResolveDialog);
 	resolve_dialog->connect("resolved", callable_mp(this, &PerforcePlugin::_scene_conflicts_resolved));
@@ -1452,12 +1707,17 @@ PerforcePlugin::PerforcePlugin() {
 	auto_checkout_check->set_tooltip_text(TTR("When off, saving a file that isn't checked out fails with a message; use right-click > Perforce: Check Out first."));
 	vbox->add_child(auto_checkout_check);
 
+	auto_delete_check = memnew(CheckBox);
+	auto_delete_check->set_text(TTR("Mark files for delete in Perforce when deleted in Godot"));
+	auto_delete_check->set_tooltip_text(TTR("Off (recommended): deleting a file in Godot only deletes it on disk. It shows up under \"Missing on disk\" in the Perforce panel, where you can restore it or deliberately mark it for delete."));
+	vbox->add_child(auto_delete_check);
+
 	Label *hint = memnew(Label(TTR("Leave fields empty to use the same settings as P4V. Your password is sent to \"p4 login\" and never stored.")));
 	hint->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
 	hint->set_modulate(Color(1, 1, 1, 0.65));
 	vbox->add_child(hint);
 
-	for (Node *node : { (Node *)dock, (Node *)connection_dialog, (Node *)confirm_dialog, (Node *)resolve_dialog, (Node *)flush_timer, (Node *)refresh_timer, (Node *)poll_timer, (Node *)reconnect_timer }) {
+	for (Node *node : { (Node *)dock, (Node *)connection_dialog, (Node *)confirm_dialog, (Node *)resolve_dialog, (Node *)review_dialog, (Node *)flush_timer, (Node *)refresh_timer, (Node *)poll_timer, (Node *)reconnect_timer }) {
 		owned_nodes.push_back(node->get_instance_id());
 	}
 

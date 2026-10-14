@@ -34,6 +34,7 @@
 #include "perforce_dock.h"
 #include "perforce_plugin.h"
 #include "perforce_resolve_dialog.h"
+#include "perforce_review_dialog.h"
 #include "scene_merger.h"
 
 #include "core/object/class_db.h"
@@ -67,6 +68,7 @@ void initialize_perforce_module(ModuleInitializationLevel p_level) {
 		GDREGISTER_INTERNAL_CLASS(PerforceContextMenu);
 		GDREGISTER_INTERNAL_CLASS(PerforceDock);
 		GDREGISTER_INTERNAL_CLASS(PerforceResolveDialog);
+		GDREGISTER_INTERNAL_CLASS(PerforceReviewDialog);
 		GDREGISTER_INTERNAL_CLASS(PerforcePlugin);
 		EditorPlugins::add_by_type<PerforcePlugin>();
 	}

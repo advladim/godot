@@ -32,6 +32,7 @@
 
 #if defined(UNIX_ENABLED)
 
+#include "core/io/file_system_write_hook.h"
 #include "core/string/ustring.h"
 
 #include <fcntl.h>
@@ -208,6 +209,17 @@ void FileAccessUnix::_close() {
 	}
 
 	if (!save_path.is_empty()) {
+#ifdef TOOLS_ENABLED
+		// With version control hooked in, don't touch files whose contents didn't change.
+		FileSystemWriteHook *hook = FileSystemWriteHook::get_singleton();
+		if (hook && FileSystemWriteHook::files_equal(path, save_path)) {
+			::unlink(path.utf8().get_data());
+			const String target = save_path;
+			save_path = "";
+			hook->write_unchanged(target);
+			return;
+		}
+#endif
 		int rename_error = rename(path.utf8().get_data(), save_path.utf8().get_data());
 
 		if (rename_error && close_fail_notify) {

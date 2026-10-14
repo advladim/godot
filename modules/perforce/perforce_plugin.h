@@ -44,6 +44,7 @@ class PopupMenu;
 class LineEdit;
 class PerforceDock;
 class PerforceResolveDialog;
+class PerforceReviewDialog;
 class PerforceWriteHook;
 class Timer;
 
@@ -72,6 +73,7 @@ class PerforcePlugin : public EditorPlugin {
 	PopupMenu *workspace_menu = nullptr;
 	LineEdit *password_edit = nullptr;
 	CheckBox *auto_checkout_check = nullptr;
+	CheckBox *auto_delete_check = nullptr;
 
 	Ref<PerforceContextMenu> filesystem_menu;
 	Ref<PerforceContextMenu> scene_tabs_menu;
@@ -82,6 +84,14 @@ class PerforcePlugin : public EditorPlugin {
 	bool confirm_is_submit = false;
 	bool confirm_is_p4ignore = false;
 	PerforceResolveDialog *resolve_dialog = nullptr;
+	PerforceReviewDialog *review_dialog = nullptr;
+
+	// Last workspace check (absolute local paths).
+	PackedStringArray health_changed, health_new, health_missing;
+	bool health_checked = false;
+	bool health_pending = false; // A check is queued or running.
+	String health_logged; // Last result written to the log (don't repeat it).
+	bool open_review_after_check = false;
 	Vector<ObjectID> owned_nodes; // Everything created above, freed in the destructor if still unowned.
 
 	bool connected = false;
@@ -171,6 +181,20 @@ class PerforcePlugin : public EditorPlugin {
 	void _wait_for_flush();
 	void _flush_now();
 	bool _is_auto_checkout() const;
+	bool _is_auto_delete() const;
+
+	void _check_health(bool p_open_review = false);
+	void _task_health();
+	void _health_done(const Dictionary &p_result);
+	void _review();
+	void _review_apply(const String &p_action, const PackedStringArray &p_paths);
+	void _task_review_apply(const String &p_action, const PackedStringArray &p_paths);
+	void _review_apply_done(const Dictionary &p_result);
+
+	void _remove_tmp();
+	void _task_remove_tmp();
+	void _remove_tmp_done(const Dictionary &p_result);
+	int _remove_local_tmp_leftovers(const String &p_dir);
 	void _apply_auto_checkout();
 
 	void _task_files(int p_action, const PackedStringArray &p_paths);

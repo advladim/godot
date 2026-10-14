@@ -9,15 +9,59 @@ When the project is inside a Perforce workspace, the editor:
 
 | You do this in Godot                  | The editor runs              |
 |---------------------------------------|------------------------------|
-| Save a scene, resource, script, ...   | `p4 edit` (if read-only)     |
+| Save a scene, resource, script, ...   | `p4 edit` (only if the file really changed) |
 | Create a file (new scene, import, ...)| `p4 add`                     |
-| Delete a file                         | `p4 delete` (or revert an add) |
+| Delete a file                         | nothing by default: the file is only deleted on disk (see below) |
 | Rename / move a file                  | `p4 move` (history is kept)  |
 | Move a folder                         | `p4 move folder/...`         |
-| Reimport assets                       | one batched `p4 edit` for all `.import` files |
+| Reimport assets                       | `p4 edit` in the background for `.import` files that changed |
 
 Files exclusively locked by a teammate (`+l`) can't be checked out; the editor
 shows who holds the lock and the save fails instead of silently overwriting.
+
+**Saves that change nothing don't touch Perforce.** If a save produces exactly
+what the file already contained (re-saving an untouched scene, Terrain3D data,
+`.import`/`.uid` files the editor regenerates), the original file is kept, nothing
+is checked out, and nothing ends up in your changelist. Line endings don't count
+as a change: Perforce gives Windows workspaces CRLF line endings, while Godot
+writes LF.
+
+**Deleting files is never automatic by default.** Deleting a file in Godot only
+deletes it on disk. It then shows up under **Missing on disk** in the Perforce
+panel, where you can restore it or deliberately mark it for delete (see
+*Workspace review*). Deleting a file you had just added undoes the add, and
+deleting a file you had moved undoes the move (the file comes back where it
+was). To get the old behaviour (`p4 delete` right away), tick **Mark files for
+delete in Perforce when deleted in Godot** in the settings (the wrench button).
+
+Tools that save by deleting a file and writing it again are handled: the file
+ends up checked out, never marked for delete.
+
+## Workspace review
+
+When it connects, the editor checks for files where your workspace and
+Perforce disagree, and shows a yellow **Workspace** line in the panel:
+
+- **Changed but not checked out:** edited outside Godot (or with P4V's
+  "allwrite"), so the change would never be submitted.
+- **New files not in Perforce:** files on disk that were never added
+  (respecting `.p4ignore`).
+- **Missing on disk:** Perforce thinks you have them, but they're gone. These
+  are what a blind `p4 reconcile` would mark for delete.
+
+Click **Review...** to see the files, tick the ones to act on, and choose
+**Check Out**, **Add**, **Restore** (gets the file back from Perforce) or
+**Mark for Delete** (asks first). Missing files start unticked, so nothing is
+deleted by accident. The refresh button next to **Review...** checks again.
+
+Use this instead of P4V's *Reconcile Offline Work* on Godot projects.
+
+## Leftover .tmp files
+
+Godot saves through a temporary file (`name1234.tmp`) and leaves it behind if a
+save is interrupted. `.p4ignore` gets a `*.tmp` line so they're never added. If
+some were added already, the panel offers **Remove Leftover .tmp Files**, which
+deletes them from Perforce (one submitted change) and from disk.
 
 Files that are already writable but not checked out (for example in a
 workspace with P4V's **allwrite** option, or a file made writable by hand) are
@@ -70,8 +114,13 @@ saving**. It's saved per project.
 
 When it's off, saving a file that isn't checked out stops with a message
 telling you to check it out first (right-click > **Perforce: Check Out**), and
-new files aren't marked for add. Deletes and renames still go through Perforce,
-and `.import`/`.uid` files are still made writable so imports never fail.
+new files aren't marked for add. Renames still go through Perforce, and
+`.import`/`.uid` files are still made writable so imports never fail.
+
+Automatic delete is a separate setting, **off** by default (see above).
+
+Both are saved per project, in `.godot/editor/project_metadata.cfg`, so each
+person chooses for themselves.
 
 ## The Perforce panel
 
@@ -88,7 +137,8 @@ yellow or red when something is wrong (logged out, server unreachable).
   pick which to keep.
 - **Checked out files:** everything you have open in this project.
   Double-click one to find it in the FileSystem dock. Select files and click
-  **Revert** to discard your changes.
+  **Revert** to discard your changes, or **Revert Unchanged** to drop every
+  checked-out file you didn't actually change.
 - **Submit:** type a description and press **Submit**. It saves all scenes
   first and submits only this project's files.
 - **Activity:** a log of everything the editor did in Perforce (checkouts,

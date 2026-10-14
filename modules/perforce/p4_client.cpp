@@ -301,6 +301,18 @@ void P4Client::make_writable(const String &p_path) {
 #endif
 }
 
+void P4Client::make_read_only(const String &p_path) {
+#ifdef WINDOWS_ENABLED
+	FileAccess::set_read_only_attribute(p_path, true);
+#else
+	BitField<FileAccess::UnixPermissionFlags> permissions = FileAccess::get_unix_permissions(p_path);
+	permissions.clear_flag(FileAccess::UNIX_WRITE_OWNER);
+	permissions.clear_flag(FileAccess::UNIX_WRITE_GROUP);
+	permissions.clear_flag(FileAccess::UNIX_WRITE_OTHER);
+	FileAccess::set_unix_permissions(p_path, permissions);
+#endif
+}
+
 String P4Client::escape(const String &p_path) {
 	return p_path.replace("%", "%25").replace("@", "%40").replace("#", "%23").replace("*", "%2A");
 }

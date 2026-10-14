@@ -61,5 +61,14 @@ public:
 	// them all at once instead of one by one (e.g. before a reimport).
 	virtual void prepare_writes(const Vector<String> &p_paths) {}
 
+	// Called when a safe save (write to a temp file, then replace) produced exactly
+	// the bytes `p_path` already contains: the temp file is discarded and the
+	// original left untouched, so the hook can undo anything it did for the write.
+	virtual void write_unchanged(const String &p_path) {}
+
+	// Whether two files have identical contents. Used by the platform file access
+	// code to skip no-op saves while a hook is installed.
+	static bool files_equal(const String &p_a, const String &p_b);
+
 	virtual ~FileSystemWriteHook() {}
 };

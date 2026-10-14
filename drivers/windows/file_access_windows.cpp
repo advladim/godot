@@ -33,6 +33,7 @@
 #include "file_access_windows.h"
 
 #include "core/config/project_settings.h"
+#include "core/io/file_system_write_hook.h"
 #include "core/os/os.h"
 #include "core/string/print_string.h"
 
@@ -243,6 +244,19 @@ void FileAccessWindows::_close() {
 	f = nullptr;
 
 	if (!save_path.is_empty()) {
+#ifdef TOOLS_ENABLED
+		// With version control hooked in, don't touch files whose contents didn't change:
+		// keeps them out of the changelist (and read-only if they weren't checked out).
+		FileSystemWriteHook *hook = FileSystemWriteHook::get_singleton();
+		if (hook && FileSystemWriteHook::files_equal(path, save_path)) {
+			DeleteFileW((LPCWSTR)(path.utf16().get_data()));
+			const String target = save_path;
+			save_path = "";
+			hook->write_unchanged(target);
+			return;
+		}
+#endif
+
 		// This workaround of trying multiple times is added to deal with paranoid Windows
 		// antiviruses that love reading just written files even if they are not executable, thus
 		// locking the file and preventing renaming from happening.

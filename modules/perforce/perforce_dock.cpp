@@ -227,18 +227,51 @@ void PerforceDock::set_remote_state(int p_outdated, int p_unresolved) {
 	_update_ui();
 }
 
-void PerforceDock::set_setup_state(int p_cache_files, bool p_p4v_ignores) {
+void PerforceDock::set_setup_state(int p_cache_files, bool p_p4v_ignores, int p_tmp_files) {
 	remove_cache_button->set_visible(p_cache_files > 0);
+	remove_tmp_button->set_visible(p_cache_files == 0 && p_tmp_files > 0);
 	p4ignore_button->set_visible(!p_p4v_ignores);
 	if (p_cache_files > 0) {
 		setup_label->set_text(vformat(TTR("The .godot folder (%d files) is in Perforce. It's the editor's local cache: it makes saving slow and causes errors for everyone. Remove it from the server; your local files are kept."), p_cache_files));
+	} else if (p_tmp_files > 0) {
+		setup_label->set_text(vformat(TTR("%d leftover temp files from failed saves (name1234.tmp) are in Perforce. They're junk and safe to remove."), p_tmp_files));
 	} else if (!p_p4v_ignores) {
 		setup_label->set_text(TTR("P4V doesn't use .p4ignore yet, so adding files in P4V can add the .godot cache folder. Godot already ignores it."));
 	}
-	setup_bar->set_visible(p_cache_files > 0 || !p_p4v_ignores);
+	setup_bar->set_visible(p_cache_files > 0 || p_tmp_files > 0 || !p_p4v_ignores);
+}
+
+void PerforceDock::set_health(int p_changed, int p_new, int p_missing, bool p_checking) {
+	if (p_checking) {
+		health_label->set_text(TTR("Checking the workspace for files Perforce doesn't know about..."));
+		health_bar->set_visible(true);
+		review_button->set_disabled(true);
+		health_refresh_button->set_disabled(true);
+		return;
+	}
+	review_button->set_disabled(false);
+	health_refresh_button->set_disabled(false);
+	Vector<String> parts;
+	if (p_changed > 0) {
+		parts.push_back(vformat(TTRN("%d changed but not checked out", "%d changed but not checked out", p_changed), p_changed));
+	}
+	if (p_new > 0) {
+		parts.push_back(vformat(TTRN("%d new file not in Perforce", "%d new files not in Perforce", p_new), p_new));
+	}
+	if (p_missing > 0) {
+		parts.push_back(vformat(TTRN("%d missing on disk", "%d missing on disk", p_missing), p_missing));
+	}
+	health_label->set_text(TTR("Workspace:") + " " + String(", ").join(parts) + ".");
+	health_bar->set_visible(!parts.is_empty());
 }
 
 void PerforceDock::add_log(const String &p_message, LogLevel p_level) {
+	// Also in the Output panel (and the console / log file), for troubleshooting.
+	if (p_level == LOG_ERROR) {
+		print_line("Perforce error: " + p_message);
+	} else {
+		print_line("Perforce: " + p_message);
+	}
 	Color color;
 	switch (p_level) {
 		case LOG_INFO:
@@ -282,6 +315,9 @@ void PerforceDock::_notification(int p_what) {
 			revert_unchanged_button->set_button_icon(get_editor_theme_icon(SNAME("Clear")));
 			submit_button->set_button_icon(get_editor_theme_icon(SNAME("VCSCommit")));
 			setup_icon->set_texture(get_editor_theme_icon(SNAME("StatusWarning")));
+			health_icon->set_texture(get_editor_theme_icon(SNAME("StatusWarning")));
+			health_refresh_button->set_button_icon(get_editor_theme_icon(SNAME("Reload")));
+			health_label->add_theme_color_override(SceneStringName(font_color), get_theme_color(SNAME("warning_color"), EditorStringName(Editor)));
 			setup_label->add_theme_color_override(SceneStringName(font_color), get_theme_color(SNAME("warning_color"), EditorStringName(Editor)));
 			outdated_label->add_theme_color_override(SceneStringName(font_color), get_theme_color(SNAME("warning_color"), EditorStringName(Editor)));
 			_update_ui();
@@ -296,6 +332,9 @@ void PerforceDock::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("resolve_requested"));
 	ADD_SIGNAL(MethodInfo("remove_cache_requested"));
 	ADD_SIGNAL(MethodInfo("revert_unchanged_requested"));
+	ADD_SIGNAL(MethodInfo("remove_tmp_requested"));
+	ADD_SIGNAL(MethodInfo("review_requested"));
+	ADD_SIGNAL(MethodInfo("health_check_requested"));
 	ADD_SIGNAL(MethodInfo("enable_p4ignore_requested"));
 	ADD_SIGNAL(MethodInfo("revert_requested", PropertyInfo(Variant::PACKED_STRING_ARRAY, "paths")));
 	ADD_SIGNAL(MethodInfo("submit_requested", PropertyInfo(Variant::STRING, "description")));
@@ -375,6 +414,36 @@ PerforceDock::PerforceDock() {
 	p4ignore_button->set_tooltip_text(TTR("Runs \"p4 set P4IGNORE=.p4ignore\" for your user on this PC, so P4V also skips files listed in .p4ignore files."));
 	p4ignore_button->connect(SceneStringName(pressed), callable_mp(this, &PerforceDock::_emit).bind(SNAME("enable_p4ignore_requested")));
 	setup_bar->add_child(p4ignore_button);
+
+	remove_tmp_button = memnew(Button);
+	remove_tmp_button->set_text(TTR("Remove Leftover .tmp Files"));
+	remove_tmp_button->connect(SceneStringName(pressed), callable_mp(this, &PerforceDock::_emit).bind(SNAME("remove_tmp_requested")));
+	setup_bar->add_child(remove_tmp_button);
+
+	health_bar = memnew(HBoxContainer);
+	health_bar->hide();
+	main_vb->add_child(health_bar);
+
+	health_icon = memnew(TextureRect);
+	health_icon->set_stretch_mode(TextureRect::STRETCH_KEEP_CENTERED);
+	health_bar->add_child(health_icon);
+
+	health_label = memnew(Label);
+	health_label->set_h_size_flags(SIZE_EXPAND_FILL);
+	health_label->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);
+	health_bar->add_child(health_label);
+
+	review_button = memnew(Button);
+	review_button->set_text(TTR("Review..."));
+	review_button->set_tooltip_text(TTR("See the files and decide what to do with each one. Nothing is deleted unless you choose to."));
+	review_button->connect(SceneStringName(pressed), callable_mp(this, &PerforceDock::_emit).bind(SNAME("review_requested")));
+	health_bar->add_child(review_button);
+
+	health_refresh_button = memnew(Button);
+	health_refresh_button->set_flat(true);
+	health_refresh_button->set_tooltip_text(TTR("Check the workspace again."));
+	health_refresh_button->connect(SceneStringName(pressed), callable_mp(this, &PerforceDock::_emit).bind(SNAME("health_check_requested")));
+	health_bar->add_child(health_refresh_button);
 
 	HSplitContainer *split = memnew(HSplitContainer);
 	split->set_v_size_flags(SIZE_EXPAND_FILL);

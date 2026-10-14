@@ -44,7 +44,8 @@
 // checks out read-only files before they are written, marks new files for
 // add, and turns deletes and renames into `p4 delete` / `p4 move`.
 class PerforceWriteHook : public FileSystemWriteHook {
-	String project_root; // Absolute, forward slashes, ends with '/'.
+	String project_root; // Absolute, forward slashes, ends with '/' (lowercase on Windows, for comparisons).
+	String project_root_original; // Same, original case (for building paths).
 	String ignored_root; // project_root + ".godot/".
 
 	Mutex pending_mutex;
@@ -57,6 +58,11 @@ class PerforceWriteHook : public FileSystemWriteHook {
 	HashSet<String> known_untracked; // Not in the depot.
 
 	SafeFlag auto_checkout;
+	SafeFlag auto_delete; // Off: deleting in Godot only deletes the local file.
+
+	HashSet<String> just_checked_out; // Checked out only for a save; reverted if the save changed nothing.
+	HashSet<String> made_writable; // .import/.uid made writable for a save; read-only again if unchanged.
+	Vector<String> local_deletes; // Deleted locally only since the last flush (for one summary message).
 
 	// Offline mode: the server can't be reached (or the first connection check
 	// hasn't finished). Nothing waits for Perforce; changes are remembered and
@@ -95,6 +101,10 @@ public:
 	// with a message instead) and new files aren't marked for add.
 	void set_auto_checkout(bool p_enabled);
 	bool is_auto_checkout() const { return auto_checkout.is_set(); }
+	// When off (the default), deleting a file in Godot never marks it for delete in
+	// Perforce; it shows up as "missing" in the panel for the user to decide.
+	void set_auto_delete(bool p_enabled);
+	bool is_auto_delete() const { return auto_delete.is_set(); }
 	// Files currently opened in this workspace (absolute paths), from a refresh.
 	void set_known_opened(const Vector<String> &p_abs_paths);
 
@@ -114,6 +124,7 @@ public:
 	virtual Error before_remove(const String &p_path) override;
 	virtual Error before_rename(const String &p_from, const String &p_to) override;
 	virtual void prepare_writes(const Vector<String> &p_paths) override;
+	virtual void write_unchanged(const String &p_path) override;
 
 	// While true on the current thread, hooks do nothing (used for our own file operations).
 	static thread_local bool suppressed;
