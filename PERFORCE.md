@@ -19,7 +19,40 @@ When the project is inside a Perforce workspace, the editor:
 Files exclusively locked by a teammate (`+l`) can't be checked out; the editor
 shows who holds the lock and the save fails instead of silently overwriting.
 
+Files that are already writable but not checked out (for example in a
+workspace with P4V's **allwrite** option, or a file made writable by hand) are
+checked out in the background right after you save them, so they always end
+up in your changelist.
+
+`.import` and `.uid` files are never allowed to fail: if one is read-only, the
+editor makes it writable immediately and checks it out in the background.
+
 Everything goes into your **default changelist**.
+
+## Right-click menu
+
+Right-click files or folders in the **FileSystem** dock (or a scene tab) for:
+
+- **Perforce: Check Out** — open the files for edit (folders: everything inside).
+- **Perforce: Mark for Add** — add new files (folders: every new file inside,
+  skipping what `.p4ignore` excludes).
+- **Perforce: Revert** — discard your changes (asks first).
+
+Right-clicking nodes in the **Scene** tree offers **Check Out Scene** and
+**Revert Scene** for the open scene (and any instanced scenes you selected).
+
+If Perforce is busy with something else, the action runs as soon as it's done.
+
+## Automatic checkout
+
+On by default. To turn it off, open the settings button (the wrench) in the
+Perforce panel and untick **Check out and add files automatically when
+saving**. It's saved per project.
+
+When it's off, saving a file that isn't checked out stops with a message
+telling you to check it out first (right-click > **Perforce: Check Out**), and
+new files aren't marked for add. Deletes and renames still go through Perforce,
+and `.import`/`.uid` files are still made writable so imports never fail.
 
 ## The Perforce panel
 

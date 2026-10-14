@@ -30,6 +30,7 @@
 
 #include "register_types.h"
 
+#include "perforce_context_menu.h"
 #include "perforce_dock.h"
 #include "perforce_plugin.h"
 #include "perforce_resolve_dialog.h"
@@ -58,6 +59,7 @@ void initialize_perforce_module(ModuleInitializationLevel p_level) {
 			std::_Exit(exit_code);
 		}
 	} else if (p_level == MODULE_INITIALIZATION_LEVEL_EDITOR) {
+		GDREGISTER_INTERNAL_CLASS(PerforceContextMenu);
 		GDREGISTER_INTERNAL_CLASS(PerforceDock);
 		GDREGISTER_INTERNAL_CLASS(PerforceResolveDialog);
 		GDREGISTER_INTERNAL_CLASS(PerforcePlugin);

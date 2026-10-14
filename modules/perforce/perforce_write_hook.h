@@ -35,6 +35,8 @@
 #include "core/io/file_system_write_hook.h"
 #include "core/os/mutex.h"
 #include "core/templates/hash_map.h"
+#include "core/templates/hash_set.h"
+#include "core/templates/safe_refcount.h"
 #include "core/variant/callable.h"
 
 // Keeps Perforce in sync with what the editor does to project files:
@@ -46,6 +48,14 @@ class PerforceWriteHook : public FileSystemWriteHook {
 
 	Mutex pending_mutex;
 	HashMap<String, int> pending_adds; // Path -> attempts left.
+	HashSet<String> pending_edits; // Written while writable but not known to be checked out.
+
+	// What we know about files, to avoid a p4 call on every save. Keys from _key().
+	// Rebuilt from the server on every refresh (set_known_opened()).
+	HashSet<String> known_opened;
+	HashSet<String> known_untracked; // Not in the depot.
+
+	SafeFlag auto_checkout;
 
 	Callable on_login_required; // Called deferred with the p4 error message.
 	Callable on_activity; // Called deferred with (message, PerforceDock::LogLevel).
@@ -53,6 +63,11 @@ class PerforceWriteHook : public FileSystemWriteHook {
 	String _normalize(const String &p_path) const;
 	bool _is_managed(const String &p_abs_path) const;
 	bool _unlock_cache_file(const String &p_abs_path) const;
+	String _key(const String &p_abs_path) const;
+	bool _is_metadata(const String &p_abs_path) const;
+	void _queue_edit(const String &p_abs_path);
+	void _flush_adds();
+	void _flush_edits();
 	String _display(const String &p_abs_path) const;
 	void _log(const String &p_message, int p_level);
 	void _report(const String &p_what, const P4Result &p_result);
@@ -60,8 +75,16 @@ class PerforceWriteHook : public FileSystemWriteHook {
 	Error _move_remaining(const String &p_from, const String &p_to);
 
 public:
-	// Not-yet-existing files queued for `p4 add` are flushed here. Call on the main thread.
-	void flush_pending_adds();
+	// Runs the queued `p4 add` / `p4 edit` commands. Safe to call from any thread.
+	void flush_pending();
+	bool has_pending();
+
+	// When off, read-only files are not checked out on save (the save is refused
+	// with a message instead) and new files aren't marked for add.
+	void set_auto_checkout(bool p_enabled);
+	bool is_auto_checkout() const { return auto_checkout.is_set(); }
+	// Files currently opened in this workspace (absolute paths), from a refresh.
+	void set_known_opened(const Vector<String> &p_abs_paths);
 	// Checks out every managed, read-only file in the list with a single command.
 	// Returns false if some of them are still read-only afterwards.
 	bool checkout(const Vector<String> &p_abs_paths);

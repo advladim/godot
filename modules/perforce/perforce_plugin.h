@@ -36,7 +36,9 @@
 #include "core/object/worker_thread_pool.h"
 #include "editor/plugins/editor_plugin.h"
 
+class CheckBox;
 class ConfirmationDialog;
+class PerforceContextMenu;
 class Label;
 class LineEdit;
 class PerforceDock;
@@ -66,6 +68,11 @@ class PerforcePlugin : public EditorPlugin {
 	LineEdit *user_edit = nullptr;
 	LineEdit *client_edit = nullptr;
 	LineEdit *password_edit = nullptr;
+	CheckBox *auto_checkout_check = nullptr;
+
+	Ref<PerforceContextMenu> filesystem_menu;
+	Ref<PerforceContextMenu> scene_tabs_menu;
+	Ref<PerforceContextMenu> scene_tree_menu;
 
 	ConfirmationDialog *confirm_dialog = nullptr;
 	Callable confirm_action;
@@ -80,7 +87,11 @@ class PerforcePlugin : public EditorPlugin {
 
 	// Background work.
 	WorkerThreadPool::TaskID task = WorkerThreadPool::INVALID_TASK_ID;
+	WorkerThreadPool::TaskID flush_task = WorkerThreadPool::INVALID_TASK_ID; // Queued adds/edits, separate from `task`.
 	bool refresh_pending = false;
+	// User actions requested while another task ran; started in order afterwards.
+	Vector<Callable> queued_tasks;
+	Vector<String> queued_texts;
 
 	// Scene files waiting for the conflict dialog. Each: { "file", "base", "yours", "theirs" }.
 	Array pending_scene_merges;
@@ -88,7 +99,8 @@ class PerforcePlugin : public EditorPlugin {
 	void _apply_connection_settings();
 	String _depot_spec() const; // Project folder as a p4 file spec.
 
-	bool _start_task(const Callable &p_task, const String &p_busy_text);
+	// Returns false if busy, unless p_queue is set (then it runs after the current task).
+	bool _start_task(const Callable &p_task, const String &p_busy_text, bool p_queue = false);
 	void _finish_task();
 
 	void _connect();
@@ -136,13 +148,27 @@ class PerforcePlugin : public EditorPlugin {
 	void _connection_dialog_confirmed();
 	void _login_required(const String &p_message);
 	void _activity(const String &p_message, int p_level);
-	void _flush_pending_adds();
+	void _flush_pending();
+	void _task_flush();
+	void _wait_for_flush();
+	void _flush_now();
+	bool _is_auto_checkout() const;
+	void _apply_auto_checkout();
+
+	void _task_files(int p_action, const PackedStringArray &p_paths);
+	void _files_done(const Dictionary &p_result);
 
 protected:
 	void _notification(int p_what);
+	static void _bind_methods();
 
 public:
 	virtual String get_plugin_name() const override { return "Perforce"; }
+
+	bool is_in_workspace() const { return !workspace_name.is_empty(); }
+	// Right-click menu entries: p_selection is a PackedStringArray of res:// paths
+	// (FileSystem dock, scene tabs) or an Array of nodes (Scene tree).
+	void context_action(const Variant &p_selection, int p_action);
 
 	PerforcePlugin();
 	~PerforcePlugin();

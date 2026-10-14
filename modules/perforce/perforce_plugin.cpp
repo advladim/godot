@@ -30,6 +30,7 @@
 
 #include "perforce_plugin.h"
 
+#include "perforce_context_menu.h"
 #include "perforce_dock.h"
 #include "perforce_resolve_dialog.h"
 #include "perforce_write_hook.h"
@@ -38,12 +39,14 @@
 #include "core/io/dir_access.h"
 #include "core/io/file_access.h"
 #include "core/object/callable_mp.h"
+#include "core/object/class_db.h"
 #include "editor/editor_interface.h"
 #include "editor/file_system/editor_file_system.h"
 #include "editor/gui/editor_toaster.h"
 #include "editor/settings/editor_settings.h"
 #include "editor/themes/editor_scale.h"
 #include "scene/gui/box_container.h"
+#include "scene/gui/check_box.h"
 #include "scene/gui/dialogs.h"
 #include "scene/gui/grid_container.h"
 #include "scene/gui/label.h"
@@ -75,7 +78,16 @@ static bool _is_text_scene(const String &p_path) {
 }
 
 static String _local_to_res(const String &p_local_path) {
-	return ProjectSettings::get_singleton()->localize_path(p_local_path.replace_char('\\', '/'));
+	const String path = p_local_path.replace_char('\\', '/');
+	const String root = ProjectSettings::get_singleton()->get_resource_path().replace_char('\\', '/').trim_suffix("/");
+#ifdef WINDOWS_ENABLED
+	// Perforce reports the workspace root as configured, e.g. "b:\Perforce\..." for
+	// a project opened as "B:/Perforce/...", and Windows paths ignore case.
+	const bool inside = path.to_lower().begins_with(root.to_lower() + "/");
+#else
+	const bool inside = path.begins_with(root + "/");
+#endif
+	return inside ? "res://" + path.substr(root.length() + 1) : path;
 }
 
 void PerforcePlugin::_apply_connection_settings() {
@@ -94,9 +106,15 @@ String PerforcePlugin::_depot_spec() const {
 
 // --- Background tasks ---------------------------------------------------
 
-bool PerforcePlugin::_start_task(const Callable &p_task, const String &p_busy_text) {
+bool PerforcePlugin::_start_task(const Callable &p_task, const String &p_busy_text, bool p_queue) {
 	if (task != WorkerThreadPool::INVALID_TASK_ID) {
-		return false; // One thing at a time.
+		// One thing at a time.
+		if (p_queue) {
+			queued_tasks.push_back(p_task);
+			queued_texts.push_back(p_busy_text);
+			return true;
+		}
+		return false;
 	}
 	dock->set_busy(true, p_busy_text);
 	task = WorkerThreadPool::get_singleton()->add_task(p_task, false, "Perforce");
@@ -109,6 +127,14 @@ void PerforcePlugin::_finish_task() {
 		task = WorkerThreadPool::INVALID_TASK_ID;
 	}
 	dock->set_busy(false);
+	if (!queued_tasks.is_empty()) {
+		const Callable next = queued_tasks[0];
+		const String text = queued_texts[0];
+		queued_tasks.remove_at(0);
+		queued_texts.remove_at(0);
+		_start_task(next, text);
+		return; // A pending refresh runs after the queue is empty.
+	}
 	if (refresh_pending) {
 		refresh_pending = false;
 		_refresh();
@@ -254,7 +280,9 @@ void PerforcePlugin::_task_refresh() {
 	P4Result opened = P4Client::run({ "fstat", "-Ro", spec });
 	result["login_required"] = opened.login_required;
 	Array files;
+	PackedStringArray opened_local;
 	for (const P4Result::Record &rec : opened.records) {
+		opened_local.push_back(P4Result::field(rec, "clientFile"));
 		const String action = P4Result::field(rec, "action");
 		if (action == "move/delete") {
 			continue; // Shown as its move/add counterpart.
@@ -267,6 +295,7 @@ void PerforcePlugin::_task_refresh() {
 		files.push_back(file);
 	}
 	result["files"] = files;
+	result["opened_local"] = opened_local;
 
 	// What teammates submitted since our last sync, and what still needs merging.
 	result["outdated"] = P4Client::run({ "sync", "-n", spec }).records.size();
@@ -285,6 +314,9 @@ void PerforcePlugin::_refresh_done(const Dictionary &p_result) {
 		_login_required(String());
 		return;
 	}
+	if (hook) {
+		hook->set_known_opened(PackedStringArray(p_result["opened_local"]));
+	}
 	dock->set_opened_files(p_result["files"]);
 	dock->set_remote_state(p_result["outdated"], p_result["unresolved"]);
 	dock->set_setup_state(p_result["cache_files"], p_result["p4v_ignores"]);
@@ -294,9 +326,7 @@ void PerforcePlugin::_refresh_done(const Dictionary &p_result) {
 
 void PerforcePlugin::_get_latest() {
 	EditorInterface::get_singleton()->save_all_scenes();
-	if (hook) {
-		hook->flush_pending_adds();
-	}
+	_flush_now();
 	_start_task(callable_mp(this, &PerforcePlugin::_task_get_latest), TTR("Getting latest from the server..."));
 }
 
@@ -542,7 +572,8 @@ void PerforcePlugin::_revert(const PackedStringArray &p_paths) {
 void PerforcePlugin::_task_revert(const PackedStringArray &p_paths) {
 	Vector<String> files;
 	for (const String &path : p_paths) {
-		files.push_back(P4Client::escape(ProjectSettings::get_singleton()->globalize_path(path)));
+		const String local = ProjectSettings::get_singleton()->globalize_path(path).trim_suffix("/");
+		files.push_back(P4Client::escape(local) + (DirAccess::dir_exists_absolute(local) ? "/..." : ""));
 	}
 	P4Result revert = P4Client::run_files({ "revert" }, files);
 	Dictionary result;
@@ -696,11 +727,9 @@ void PerforcePlugin::_confirmed() {
 	}
 	if (confirm_is_submit) {
 		EditorInterface::get_singleton()->save_all_scenes();
-		if (hook) {
-			hook->flush_pending_adds(); // New files must be marked for add before submitting.
-		}
+		_flush_now(); // New files must be marked for add before submitting.
 	}
-	_start_task(confirm_action, TTR("Talking to the server..."));
+	_start_task(confirm_action, TTR("Talking to the server..."), true);
 	confirm_action = Callable();
 }
 
@@ -712,6 +741,7 @@ void PerforcePlugin::_install_hook() {
 	}
 	hook = memnew(PerforceWriteHook(project_root, callable_mp(this, &PerforcePlugin::_login_required), callable_mp(this, &PerforcePlugin::_activity)));
 	FileSystemWriteHook::set_singleton(hook);
+	_apply_auto_checkout();
 	if (flush_timer->is_inside_tree()) {
 		flush_timer->start();
 	}
@@ -722,7 +752,7 @@ void PerforcePlugin::_remove_hook() {
 		return;
 	}
 	flush_timer->stop();
-	hook->flush_pending_adds();
+	_flush_now();
 	if (FileSystemWriteHook::get_singleton() == hook) {
 		FileSystemWriteHook::set_singleton(nullptr);
 	}
@@ -739,10 +769,160 @@ void PerforcePlugin::_activity(const String &p_message, int p_level) {
 	refresh_timer->start(); // Update the file list once things settle down.
 }
 
-void PerforcePlugin::_flush_pending_adds() {
-	if (hook) {
-		hook->flush_pending_adds();
+// Runs queued `p4 add` / `p4 edit` commands on a worker thread, so saving never waits for the server.
+void PerforcePlugin::_flush_pending() {
+	if (!hook || !hook->has_pending()) {
+		return;
 	}
+	if (flush_task != WorkerThreadPool::INVALID_TASK_ID) {
+		if (!WorkerThreadPool::get_singleton()->is_task_completed(flush_task)) {
+			return; // Still busy; the next tick picks up the rest.
+		}
+		_wait_for_flush();
+	}
+	flush_task = WorkerThreadPool::get_singleton()->add_task(callable_mp(this, &PerforcePlugin::_task_flush), false, "Perforce flush");
+}
+
+void PerforcePlugin::_task_flush() {
+	hook->flush_pending();
+}
+
+void PerforcePlugin::_wait_for_flush() {
+	if (flush_task != WorkerThreadPool::INVALID_TASK_ID) {
+		WorkerThreadPool::get_singleton()->wait_for_task_completion(flush_task);
+		flush_task = WorkerThreadPool::INVALID_TASK_ID;
+	}
+}
+
+// Flushes everything before an operation that depends on it (submit, get latest, shutdown).
+void PerforcePlugin::_flush_now() {
+	_wait_for_flush();
+	if (hook) {
+		hook->flush_pending();
+	}
+}
+
+bool PerforcePlugin::_is_auto_checkout() const {
+	return EditorSettings::get_singleton()->get_project_metadata("perforce", "auto_checkout", true);
+}
+
+void PerforcePlugin::_apply_auto_checkout() {
+	if (hook) {
+		hook->set_auto_checkout(_is_auto_checkout());
+	}
+}
+
+// --- Right-click menus ---------------------------------------------------
+
+void PerforcePlugin::context_action(const Variant &p_selection, int p_action) {
+	PackedStringArray paths;
+	if (p_selection.get_type() == Variant::ARRAY) {
+		// Scene tree: the open scene's file, plus instanced scenes that were selected.
+		Node *root = EditorInterface::get_singleton()->get_edited_scene_root();
+		if (root && !root->get_scene_file_path().is_empty()) {
+			paths.push_back(root->get_scene_file_path());
+		}
+		const Array nodes = p_selection;
+		for (const Variant &v : nodes) {
+			Node *node = Object::cast_to<Node>(v.get_validated_object());
+			if (node && node != root && !node->get_scene_file_path().is_empty() && !paths.has(node->get_scene_file_path())) {
+				paths.push_back(node->get_scene_file_path());
+			}
+		}
+	} else {
+		paths = p_selection;
+	}
+	if (paths.is_empty()) {
+		dock->add_log(TTR("Save the scene first, then check it out."), PerforceDock::LOG_WARNING);
+		return;
+	}
+
+	if (p_action == PerforceContextMenu::ACTION_REVERT) {
+		_revert(paths);
+		return;
+	}
+	const String busy = p_action == PerforceContextMenu::ACTION_ADD ? TTR("Marking files for add...") : TTR("Checking out...");
+	_start_task(callable_mp(this, &PerforcePlugin::_task_files).bind(p_action, paths), busy, true);
+}
+
+void PerforcePlugin::_task_files(int p_action, const PackedStringArray &p_paths) {
+	Vector<String> files, folders;
+	for (const String &path : p_paths) {
+		const String local = ProjectSettings::get_singleton()->globalize_path(path).trim_suffix("/");
+		if (DirAccess::dir_exists_absolute(local)) {
+			folders.push_back(P4Client::escape(local) + "/...");
+		} else {
+			files.push_back(local);
+		}
+	}
+
+	P4Result result;
+	result.exit_code = 0;
+	auto merge = [&result](const P4Result &p_part) {
+		for (const P4Result::Record &record : p_part.records) {
+			result.records.push_back(P4Result::Record(record));
+		}
+		result.infos.append_array(p_part.infos);
+		result.warnings.append_array(p_part.warnings);
+		result.errors.append_array(p_part.errors);
+		result.login_required = result.login_required || p_part.login_required;
+	};
+
+	if (p_action == PerforceContextMenu::ACTION_ADD) {
+		if (!files.is_empty()) {
+			merge(P4Client::run_files({ "add", "-f" }, files)); // -f: unescaped names with @ # % *.
+		}
+		for (const String &folder : folders) {
+			merge(P4Client::run({ "reconcile", "-a", folder })); // New files in the folder, honoring .p4ignore.
+		}
+	} else {
+		Vector<String> specs = folders;
+		for (const String &file : files) {
+			specs.push_back(P4Client::escape(file));
+		}
+		merge(P4Client::run_files({ "edit" }, specs));
+		// `p4 edit` makes the files writable; also catch ones it reported as already open.
+	}
+
+	// Tagged output: one record per file opened; "currently opened" for files that already were.
+	int done = result.records.size();
+	int already = 0;
+	for (const String &info : result.infos) {
+		if (info.contains("currently opened")) {
+			already++;
+		}
+	}
+	Dictionary out;
+	out["action"] = p_action;
+	out["done"] = done;
+	out["already"] = already;
+	out["requested"] = p_paths.size();
+	out["messages"] = result.get_messages();
+	out["login_required"] = result.login_required;
+	callable_mp(this, &PerforcePlugin::_files_done).call_deferred(out);
+}
+
+void PerforcePlugin::_files_done(const Dictionary &p_result) {
+	_finish_task();
+	if ((bool)p_result["login_required"]) {
+		_login_required(String());
+		return;
+	}
+	const bool add = (int)p_result["action"] == PerforceContextMenu::ACTION_ADD;
+	const String messages = p_result["messages"];
+	const int done = p_result["done"];
+	const int already = p_result["already"];
+	if (already > 0) {
+		dock->add_log(vformat(TTRN("%d file was already checked out.", "%d files were already checked out.", already), already), PerforceDock::LOG_INFO);
+	}
+	if (done > 0) {
+		dock->add_log(add ? vformat(TTRN("Marked %d file for add.", "Marked %d files for add.", done), done) : vformat(TTRN("Checked out %d file.", "Checked out %d files.", done), done), PerforceDock::LOG_SUCCESS);
+	}
+	if (!messages.is_empty()) {
+		// Not in the depot, locked, ignored... Perforce explains it best.
+		dock->add_log(messages, done > 0 ? PerforceDock::LOG_INFO : PerforceDock::LOG_WARNING);
+	}
+	_refresh();
 }
 
 // --- Connection dialog ---------------------------------------------------
@@ -763,6 +943,7 @@ void PerforcePlugin::_show_connection_dialog(const String &p_message) {
 	client_edit->set_text(_get_setting("client"));
 	client_edit->set_placeholder(workspace_name.is_empty() ? P4Client::get_variable("P4CLIENT") : workspace_name);
 	password_edit->clear();
+	auto_checkout_check->set_pressed(_is_auto_checkout());
 
 	connection_message->set_text(p_message);
 	connection_message->set_visible(!p_message.is_empty());
@@ -774,6 +955,11 @@ void PerforcePlugin::_connection_dialog_confirmed() {
 	EditorSettings::get_singleton()->set_project_metadata("perforce", "port", port_edit->get_text().strip_edges());
 	EditorSettings::get_singleton()->set_project_metadata("perforce", "user", user_edit->get_text().strip_edges());
 	EditorSettings::get_singleton()->set_project_metadata("perforce", "client", client_edit->get_text().strip_edges());
+	if (auto_checkout_check->is_pressed() != _is_auto_checkout()) {
+		EditorSettings::get_singleton()->set_project_metadata("perforce", "auto_checkout", auto_checkout_check->is_pressed());
+		dock->add_log(auto_checkout_check->is_pressed() ? TTR("Automatic checkout is on: saving checks files out and marks new files for add.") : TTR("Automatic checkout is off: check files out with right-click > Perforce: Check Out before editing them."), PerforceDock::LOG_INFO);
+	}
+	_apply_auto_checkout();
 	_apply_connection_settings();
 
 	const String password = password_edit->get_text();
@@ -801,6 +987,12 @@ void PerforcePlugin::_login_required(const String &p_message) {
 
 // --- Setup ------------------------------------------------------------
 
+void PerforcePlugin::_bind_methods() {
+	// Same entry point as the right-click menus; also usable from editor scripts.
+	ClassDB::bind_method(D_METHOD("context_action", "selection", "action"), &PerforcePlugin::context_action);
+}
+
+
 void PerforcePlugin::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_ENTER_TREE: {
@@ -812,6 +1004,12 @@ void PerforcePlugin::_notification(int p_what) {
 			add_child(flush_timer);
 			add_child(refresh_timer);
 			add_child(poll_timer);
+			filesystem_menu = Ref<PerforceContextMenu>(memnew(PerforceContextMenu(get_instance_id(), true)));
+			scene_tabs_menu = Ref<PerforceContextMenu>(memnew(PerforceContextMenu(get_instance_id(), true)));
+			scene_tree_menu = Ref<PerforceContextMenu>(memnew(PerforceContextMenu(get_instance_id(), false)));
+			add_context_menu_plugin(EditorContextMenuPlugin::CONTEXT_SLOT_FILESYSTEM, filesystem_menu);
+			add_context_menu_plugin(EditorContextMenuPlugin::CONTEXT_SLOT_SCENE_TABS, scene_tabs_menu);
+			add_context_menu_plugin(EditorContextMenuPlugin::CONTEXT_SLOT_SCENE_TREE, scene_tree_menu);
 			if (hook) {
 				flush_timer->start();
 			}
@@ -828,9 +1026,10 @@ void PerforcePlugin::_notification(int p_what) {
 			}
 			// The hook stays installed until the plugin is destroyed: the editor
 			// still saves files (project metadata, layout) while shutting down.
-			if (hook) {
-				hook->flush_pending_adds();
-			}
+			_flush_now();
+			remove_context_menu_plugin(filesystem_menu);
+			remove_context_menu_plugin(scene_tabs_menu);
+			remove_context_menu_plugin(scene_tree_menu);
 			remove_dock(dock);
 		} break;
 	}
@@ -852,7 +1051,7 @@ PerforcePlugin::PerforcePlugin() {
 
 	flush_timer = memnew(Timer);
 	flush_timer->set_wait_time(0.5);
-	flush_timer->connect("timeout", callable_mp(this, &PerforcePlugin::_flush_pending_adds));
+	flush_timer->connect("timeout", callable_mp(this, &PerforcePlugin::_flush_pending));
 
 	refresh_timer = memnew(Timer);
 	refresh_timer->set_wait_time(1.5);
@@ -901,6 +1100,11 @@ PerforcePlugin::PerforcePlugin() {
 	password_edit->set_secret(true);
 	password_edit->set_placeholder(TTR("Only needed when not logged in"));
 	connection_dialog->register_text_enter(password_edit);
+
+	auto_checkout_check = memnew(CheckBox);
+	auto_checkout_check->set_text(TTR("Check out and add files automatically when saving"));
+	auto_checkout_check->set_tooltip_text(TTR("When off, saving a file that isn't checked out fails with a message; use right-click > Perforce: Check Out first."));
+	vbox->add_child(auto_checkout_check);
 
 	Label *hint = memnew(Label(TTR("Leave fields empty to use the same settings as P4V. Your password is sent to \"p4 login\" and never stored.")));
 	hint->set_autowrap_mode(TextServer::AUTOWRAP_WORD_SMART);

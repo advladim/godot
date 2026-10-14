@@ -91,6 +91,42 @@ bool PerforceWriteHook::_unlock_cache_file(const String &p_abs_path) const {
 	return true;
 }
 
+// Case-insensitive on Windows, like its file system.
+String PerforceWriteHook::_key(const String &p_abs_path) const {
+#ifdef WINDOWS_ENABLED
+	return p_abs_path.to_lower();
+#else
+	return p_abs_path;
+#endif
+}
+
+// .import and .uid files are rewritten by the editor on its own (imports,
+// UID assignment). They must never block on Perforce or fail to save.
+bool PerforceWriteHook::_is_metadata(const String &p_abs_path) const {
+	return p_abs_path.ends_with(".import") || p_abs_path.ends_with(".uid");
+}
+
+void PerforceWriteHook::_queue_edit(const String &p_abs_path) {
+	MutexLock lock(pending_mutex);
+	const String key = _key(p_abs_path);
+	if (!known_opened.has(key) && !known_untracked.has(key)) {
+		pending_edits.insert(p_abs_path);
+	}
+}
+
+void PerforceWriteHook::set_auto_checkout(bool p_enabled) {
+	auto_checkout.set_to(p_enabled);
+}
+
+void PerforceWriteHook::set_known_opened(const Vector<String> &p_abs_paths) {
+	MutexLock lock(pending_mutex);
+	known_opened.clear();
+	known_untracked.clear(); // Files may have been added since; ask again when needed.
+	for (const String &path : p_abs_paths) {
+		known_opened.insert(_key(_normalize(path)));
+	}
+}
+
 // Path relative to the project, for messages.
 String PerforceWriteHook::_display(const String &p_abs_path) const {
 	return p_abs_path.substr(project_root.length());
@@ -152,6 +188,12 @@ bool PerforceWriteHook::checkout(const Vector<String> &p_abs_paths) {
 	}
 	if (!checked_out.is_empty()) {
 		_log("Checked out " + _join_names(checked_out, "%d files"), PerforceDock::LOG_INFO);
+		MutexLock lock(pending_mutex);
+		for (const String &path : candidates) {
+			if (!P4Client::is_read_only(path)) {
+				known_opened.insert(_key(path));
+			}
+		}
 	}
 	if (!still_read_only.is_empty() && result.errors.is_empty()) {
 		// Exclusive locks report "//depot/x - also opened by bob@bobs_workspace".
@@ -174,7 +216,79 @@ bool PerforceWriteHook::checkout(const Vector<String> &p_abs_paths) {
 	return still_read_only.is_empty();
 }
 
-void PerforceWriteHook::flush_pending_adds() {
+bool PerforceWriteHook::has_pending() {
+	MutexLock lock(pending_mutex);
+	return !pending_adds.is_empty() || !pending_edits.is_empty();
+}
+
+void PerforceWriteHook::flush_pending() {
+	_flush_adds();
+	_flush_edits();
+}
+
+// Checks out files that were saved while already writable (P4V "allwrite"
+// workspaces, files made writable by hand, .import/.uid files), so the
+// changes end up in the changelist.
+void PerforceWriteHook::_flush_edits() {
+	Vector<String> to_edit;
+	{
+		MutexLock lock(pending_mutex);
+		for (const String &path : pending_edits) {
+			to_edit.push_back(path);
+		}
+		pending_edits.clear();
+	}
+	if (to_edit.is_empty()) {
+		return;
+	}
+
+	Vector<String> escaped;
+	for (const String &path : to_edit) {
+		escaped.push_back(P4Client::escape(path));
+	}
+	P4Result result = P4Client::run_files({ "edit" }, escaped);
+	_report("Checking out files", result);
+	if (result.login_required) {
+		return;
+	}
+
+	HashSet<String> opened_now;
+	for (const P4Result::Record &rec : result.records) {
+		opened_now.insert(_key(_normalize(P4Result::field(rec, "clientFile"))));
+	}
+
+	Vector<String> checked_out, locked;
+	MutexLock lock(pending_mutex);
+	for (const String &path : to_edit) {
+		const String key = _key(path);
+		const String name = path.get_file();
+		bool untracked = false;
+		for (const String &warning : result.warnings) {
+			if (warning.contains(name) && (warning.contains("not on client") || warning.contains("not in client view") || warning.contains("no such file") || warning.contains("can't edit exclusive"))) {
+				untracked = !warning.contains("can't edit exclusive");
+				if (warning.contains("can't edit exclusive")) {
+					locked.push_back(_display(path));
+				}
+			}
+		}
+		if (opened_now.has(key)) {
+			known_opened.insert(key);
+			checked_out.push_back(_display(path));
+		} else if (untracked) {
+			known_untracked.insert(key);
+		} else if (!locked.has(_display(path))) {
+			known_opened.insert(key); // "currently opened for edit/add".
+		}
+	}
+	if (!checked_out.is_empty()) {
+		_log("Checked out " + _join_names(checked_out, "%d files"), PerforceDock::LOG_INFO);
+	}
+	if (!locked.is_empty()) {
+		_log(vformat("%s is locked by someone else, so your changes to it can't be submitted until they submit or revert it.", _join_names(locked, "%d files")), PerforceDock::LOG_WARNING);
+	}
+}
+
+void PerforceWriteHook::_flush_adds() {
 	Vector<String> to_add;
 	{
 		MutexLock lock(pending_mutex);
@@ -201,16 +315,19 @@ void PerforceWriteHook::flush_pending_adds() {
 	P4Result result = P4Client::run_files({ "add", "-f" }, to_add);
 	_report("Adding new files", result);
 
+	// Tagged output: one record per file opened for add.
 	Vector<String> added;
-	for (const String &info : result.infos) {
-		if (info.ends_with("opened for add")) {
-			// "//depot/game/new%402x.png#1 - opened for add"
-			String depot_file = info.get_slicec(' ', 0).get_slicec('#', 0);
-			added.push_back(depot_file.get_file().replace("%40", "@").replace("%23", "#").replace("%2A", "*").replace("%25", "%"));
+	for (const P4Result::Record &rec : result.records) {
+		if (P4Result::field(rec, "action") == "add") {
+			added.push_back(_normalize(P4Result::field(rec, "clientFile")).get_file());
 		}
 	}
 	if (!added.is_empty()) {
 		_log("Marked as new: " + _join_names(added, "%d files"), PerforceDock::LOG_INFO);
+	}
+	MutexLock lock(pending_mutex);
+	for (const String &path : to_add) {
+		known_opened.insert(_key(path));
 	}
 }
 
@@ -222,17 +339,38 @@ Error PerforceWriteHook::before_write(const String &p_path) {
 	if (_unlock_cache_file(path) || !_is_managed(path)) {
 		return OK;
 	}
-	if (FileAccess::exists(path)) {
-		// Writable files are already checked out (or not versioned); nothing to do.
-		// Refuse up front if checkout fails (locked by someone else), instead of
-		// failing later with a confusing "safe save failed" and a stray temp file.
-		if (P4Client::is_read_only(path) && !checkout({ path })) {
+	const bool automatic = auto_checkout.is_set();
+	if (!FileAccess::exists(path)) {
+		if (automatic) {
+			// p4 can only add files that exist; queue it until the file has been written.
+			MutexLock lock(pending_mutex);
+			pending_adds[path] = ADD_ATTEMPTS;
+		}
+		return OK;
+	}
+
+	if (P4Client::is_read_only(path)) {
+		if (_is_metadata(path)) {
+			// Never let .import/.uid writes fail; check them out in the background.
+			P4Client::make_writable(path);
+			if (automatic) {
+				_queue_edit(path);
+			}
+			return OK;
+		}
+		if (!automatic) {
+			_log(vformat("%s isn't checked out, so it can't be saved. Right-click it in the FileSystem dock > Perforce: Check Out (automatic checkout is off).", _display(path)), PerforceDock::LOG_ERROR);
 			return ERR_FILE_NO_PERMISSION;
 		}
-	} else {
-		// p4 can only add files that exist; queue it until the file has been written.
-		MutexLock lock(pending_mutex);
-		pending_adds[path] = ADD_ATTEMPTS;
+		// Refuse up front if checkout fails (locked by someone else), instead of
+		// failing later with a confusing "safe save failed" and a stray temp file.
+		return checkout({ path }) ? OK : ERR_FILE_NO_PERMISSION;
+	}
+
+	// Writable but maybe not checked out (P4V "allwrite" workspaces, files made
+	// writable by hand): make sure Perforce knows, without slowing the save down.
+	if (automatic) {
+		_queue_edit(path);
 	}
 	return OK;
 }
@@ -389,11 +527,20 @@ void PerforceWriteHook::prepare_writes(const Vector<String> &p_paths) {
 	if (suppressed) {
 		return;
 	}
-	Vector<String> paths;
-	for (const String &path : p_paths) {
-		paths.push_back(_normalize(path));
+	// Called before a reimport rewrites these .import files: make them writable
+	// right away and check them out in the background, all in one command.
+	for (const String &p : p_paths) {
+		const String path = _normalize(p);
+		if (!_is_managed(path) || !FileAccess::exists(path)) {
+			continue;
+		}
+		if (P4Client::is_read_only(path)) {
+			P4Client::make_writable(path);
+		}
+		if (auto_checkout.is_set()) {
+			_queue_edit(path);
+		}
 	}
-	checkout(paths);
 }
 
 PerforceWriteHook::PerforceWriteHook(const String &p_project_root, const Callable &p_on_login_required, const Callable &p_on_activity) {
@@ -407,4 +554,5 @@ PerforceWriteHook::PerforceWriteHook(const String &p_project_root, const Callabl
 	ignored_root = project_root + ".godot/";
 	on_login_required = p_on_login_required;
 	on_activity = p_on_activity;
+	auto_checkout.set();
 }

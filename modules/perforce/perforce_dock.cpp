@@ -207,8 +207,10 @@ void PerforceDock::set_opened_files(const Array &p_files) {
 		item->set_metadata(0, path);
 		item->set_tooltip_text(1, path);
 		if (!other.is_empty()) {
-			item->set_text(2, vformat(TTR("Also opened by %s"), other));
-			item->set_custom_color(2, get_theme_color(SNAME("warning_color"), EditorStringName(Editor)));
+			// Shown after the name, only when it applies (no empty column otherwise).
+			item->set_suffix(1, "  " + vformat(TTR("(also opened by %s)"), other));
+			item->set_custom_color(1, get_theme_color(SNAME("warning_color"), EditorStringName(Editor)));
+			item->set_tooltip_text(1, path + "\n" + vformat(TTR("Also opened by %s"), other));
 		}
 		if (selected.has(path)) {
 			item->select(0);
@@ -388,11 +390,10 @@ PerforceDock::PerforceDock() {
 	files_tree->set_v_size_flags(SIZE_EXPAND_FILL);
 	files_tree->set_hide_root(true);
 	files_tree->set_select_mode(Tree::SELECT_MULTI);
-	files_tree->set_columns(3);
+	files_tree->set_columns(2);
 	files_tree->set_column_expand(0, false);
-	files_tree->set_column_custom_minimum_width(0, 110 * EDSCALE);
-	files_tree->set_column_expand(2, false);
-	files_tree->set_column_custom_minimum_width(2, 200 * EDSCALE);
+	files_tree->set_column_custom_minimum_width(0, 100 * EDSCALE);
+	files_tree->set_column_clip_content(1, true);
 	files_tree->set_tooltip_text(TTR("Double-click to show the file in the FileSystem dock."));
 	files_tree->connect("multi_selected", callable_mp(this, &PerforceDock::_files_selected).unbind(3));
 	files_tree->connect("item_activated", callable_mp(this, &PerforceDock::_files_activated));
